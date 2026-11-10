@@ -231,12 +231,12 @@ Once configured, you can ask your AI assistant:
 | Function | Description |
 |----------|-------------|
 | `get_libraries` | List all Plex libraries |
-| `get_library_items` | List items in a library with pagination |
+| `get_library_items` | List items in a library with pagination; filter by `label`, or pass `user` to list what that user sees |
 | `export_library` | Export a full library to JSON (under `./exports`) |
-| `search_media` | Search media globally or within one library |
+| `search_media` | Search media globally or within one library; `user` searches as that user |
 | `get_recently_added` | Recently added content; pass `type` and `libraryKey` to list e.g. new episodes (TV is otherwise grouped by season) |
 | `get_on_deck` | Continue watching list |
-| `get_media_details` | Detailed media info |
+| `get_media_details` | Detailed media info; with `user`, reports `visible: false` when that user cannot see it |
 | `get_editable_fields` | Show editable fields, available tags and locked fields for an item |
 | `get_playlists` | List all Plex playlists |
 | `get_playlist_items` | List items in a playlist |
@@ -250,6 +250,11 @@ Once configured, you can ask your AI assistant:
 | `get_popular_content` | Most popular content analysis |
 | `get_recommendations` | Personalized movie recommendations based on your watch history |
 | `get_active_sessions` | Currently active Plex streams — who is watching what, player state, transcoding |
+
+`user` takes a Home or shared user's name or plex.tv user id. The server asks plex.tv for that
+user's token for this server and reads with it, so label restrictions, content ratings and shared
+libraries apply exactly as they do for the user. It needs the server owner's token, and the user's
+token is never returned. Write tools always act as the configured account.
 
 ### Write Operations (12 tools, opt-in)
 

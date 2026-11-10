@@ -63,7 +63,9 @@ export function createPlexToolRegistry(tools: PlexTools, options: ToolRegistryOp
       args.type as string | undefined,
       (args.limit as number) || DEFAULT_LIMITS.libraryItems,
       (args.offset as number) || 0,
-      args.sort as string | undefined
+      args.sort as string | undefined,
+      args.user as string | undefined,
+      args.label as string | undefined
     )
   );
 
@@ -82,7 +84,8 @@ export function createPlexToolRegistry(tools: PlexTools, options: ToolRegistryOp
       args.type as string | undefined,
       args.libraryKey as string | undefined,
       (args.limit as number) || DEFAULT_LIMITS.searchMedia,
-      (args.offset as number) || 0
+      (args.offset as number) || 0,
+      args.user as string | undefined
     )
   );
 
@@ -97,7 +100,7 @@ export function createPlexToolRegistry(tools: PlexTools, options: ToolRegistryOp
   registry.register("get_on_deck", () => tools.getOnDeck());
 
   registry.register("get_media_details", (args) =>
-    tools.getMediaDetails(args.ratingKey as string)
+    tools.getMediaDetails(args.ratingKey as string, args.user as string | undefined)
   );
 
   registry.register("get_editable_fields", (args) =>
