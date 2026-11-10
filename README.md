@@ -257,8 +257,8 @@ Set `PLEX_ENABLE_MUTATIVE_OPS=true` to enable these tools. They allow your AI as
 
 | Function | Description |
 |----------|-------------|
-| `update_metadata` | Update metadata fields and editable tags for a media item. A tag field is locked against refreshes while it holds tags; passing an empty list clears it and unlocks it |
-| `update_metadata_from_json` | Apply a metadata JSON payload using best-effort field mapping |
+| `update_metadata` | Update metadata fields and editable tags (`genres`, `collections`, `roles`, `directors`, `labels`) for a media item. A tag field is locked against refreshes while it holds tags; passing an empty list clears it and unlocks it |
+| `update_metadata_from_json` | Apply a metadata JSON payload using best-effort field mapping, including `labels` |
 | `create_playlist` | Create a new smart or static playlist |
 | `add_to_playlist` | Add a media item to a playlist |
 | `remove_from_playlist` | Remove an item from a playlist |
@@ -269,6 +269,8 @@ Set `PLEX_ENABLE_MUTATIVE_OPS=true` to enable these tools. They allow your AI as
 | `rate_media` | Set the user's rating for a media item from 0 to 10 |
 | `mark_watched` | Mark a media item as watched |
 | `mark_unwatched` | Mark a media item as unwatched |
+
+Labels on movies and shows can control what Plex Home profiles and shared users see through their allow/exclude label restrictions. Pass the complete desired set to `update_metadata`, for example `{"ratingKey":"42","labels":["Kids"]}`. To remove a label, omit it from that set; `{"ratingKey":"42","labels":[]}` removes all labels and unlocks the field. Existing labels are exposed by `get_editable_fields` and `get_media_details`. The same `labels` field is supported in `update_metadata_from_json` payloads.
 
 ### Sonarr Tools (12 tools)
 

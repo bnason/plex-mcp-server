@@ -31,6 +31,17 @@ describe("tools/list", () => {
     for (const tool of WRITE_TOOLS) expect(names()).toContain(tool);
   });
 
+  it("advertises label replacement in the metadata schema", () => {
+    process.env[PLEX_MUTATIVE_OPS_ENV_VAR] = "true";
+    const schema = listedToolSchemas().find((s) => s.name === "update_metadata");
+    expect(schema?.inputSchema.properties).toHaveProperty("labels", {
+      type: "array",
+      description: "Replace labels with these tags (optional); an empty list clears and unlocks the field",
+      items: { type: "string" },
+    });
+    expect(schema?.inputSchema).toHaveProperty("required", ["ratingKey"]);
+  });
+
   it("annotates every listed tool", () => {
     process.env[PLEX_MUTATIVE_OPS_ENV_VAR] = "true";
 

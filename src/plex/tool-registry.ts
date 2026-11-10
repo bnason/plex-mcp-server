@@ -219,6 +219,7 @@ export function createPlexToolRegistry(tools: PlexTools, options: ToolRegistryOp
       collections: args.collections as unknown[] | undefined,
       roles: args.roles as unknown[] | undefined,
       directors: args.directors as unknown[] | undefined,
+      labels: args.labels as unknown[] | undefined,
     })
   ));
 

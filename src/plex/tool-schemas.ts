@@ -306,6 +306,7 @@ const UPDATE_METADATA_SCHEMA = {
       rating: { type: "number", description: "New user rating (optional)" },
       tagline: { type: "string", description: "New tagline (optional)" },
       studio: { type: "string", description: "New studio (optional)" },
+      labels: { type: "array", description: "Replace labels with these tags (optional); an empty list clears and unlocks the field", items: { type: "string" } },
       genres: { type: "array", description: "Replace genres with these tags (optional)", items: { type: "string" } },
       collections: {
         type: "array",

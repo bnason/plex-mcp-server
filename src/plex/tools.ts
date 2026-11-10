@@ -128,9 +128,10 @@ type MetadataUpdateInput = {
   collections?: unknown[];
   roles?: unknown[];
   directors?: unknown[];
+  labels?: unknown[];
 };
 
-type EditableTagType = "genre" | "collection" | "role" | "director";
+type EditableTagType = "genre" | "collection" | "role" | "director" | "label";
 
 export class PlexTools {
   private machineIdentifier?: string;
@@ -447,6 +448,7 @@ export class PlexTools {
       collections: (item.Collection as Array<{ tag: string }> | undefined)?.map((c) => c.tag) || [],
       roles: (item.Role as Array<{ tag: string }> | undefined)?.map((r) => r.tag) || [],
       directors: (item.Director as Array<{ tag: string }> | undefined)?.map((d) => d.tag) || [],
+      labels: (item.Label as Array<{ tag: string }> | undefined)?.map((l) => l.tag) || [],
     };
 
     const editableFields = [
@@ -623,6 +625,7 @@ export class PlexTools {
         summary: item.summary,
         rating: item.rating,
         duration: item.duration,
+        labels: (item.Label as Array<{ tag: string }> | undefined)?.map((l) => l.tag) || [],
         genres: (item.Genre as Array<{ tag: string }> | undefined)?.map((g) => g.tag) || [],
         actors: (item.Role as Array<{ tag: string }> | undefined)?.map((r) => r.tag) || [],
         directors: (item.Director as Array<{ tag: string }> | undefined)?.map((d) => d.tag) || [],
@@ -658,13 +661,15 @@ export class PlexTools {
       collections: this.normalizeTagList(input.collections),
       roles: this.normalizeTagList(input.roles),
       directors: this.normalizeTagList(input.directors),
+      labels: this.normalizeTagList(input.labels),
     };
 
     const hasTagUpdates =
       input.genres !== undefined ||
       input.collections !== undefined ||
       input.roles !== undefined ||
-      input.directors !== undefined;
+      input.directors !== undefined ||
+      input.labels !== undefined;
 
     if (Object.keys(params).length === 0 && !hasTagUpdates) {
       throw new McpError(
@@ -704,6 +709,11 @@ export class PlexTools {
       }
       if (input.directors !== undefined) {
         const result = await this.replaceTagsSafely(input.ratingKey, "director", tagInputs.directors);
+        if (result.success) anySuccess = true;
+        tagResults.push(result);
+      }
+      if (input.labels !== undefined) {
+        const result = await this.replaceTagsSafely(input.ratingKey, "label", tagInputs.labels);
         if (result.success) anySuccess = true;
         tagResults.push(result);
       }
@@ -749,6 +759,7 @@ export class PlexTools {
     if ("collections" in metadata) mapped.collections = metadata.collections as unknown[];
     if ("roles" in metadata) mapped.roles = metadata.roles as unknown[];
     if ("directors" in metadata) mapped.directors = metadata.directors as unknown[];
+    if ("labels" in metadata) mapped.labels = metadata.labels as unknown[];
 
     const warnings: string[] = [];
     let metadataUpdated = false;
@@ -790,6 +801,7 @@ export class PlexTools {
       "collections",
       "roles",
       "directors",
+      "labels",
       "images",
     ]);
     const ignoredFields = Object.keys(metadata).filter((key) => !supportedKeys.has(key));
@@ -1629,6 +1641,8 @@ export class PlexTools {
           return item.Collection as Array<{ tag: string }> | undefined;
         case "director":
           return item.Director as Array<{ tag: string }> | undefined;
+        case "label":
+          return item.Label as Array<{ tag: string }> | undefined;
         case "role":
           return item.Role as Array<{ tag: string }> | undefined;
       }

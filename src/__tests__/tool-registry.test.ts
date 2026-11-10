@@ -1,7 +1,20 @@
-import { describe, it, expect, vi } from "vitest";
-import { ToolRegistry } from "../plex/tool-registry.js";
+import { describe, it, expect, vi, afterEach } from "vitest";
+import { PlexTools } from "../plex/tools.js";
+import { ToolRegistry, createPlexToolRegistry } from "../plex/tool-registry.js";
 
 describe("ToolRegistry", () => {
+  describe("metadata label dispatch", () => {
+    afterEach(() => vi.unstubAllEnvs());
+
+    it.each([["Kids"], []].map((labels) => ({ labels })))("forwards labels $labels", async ({ labels }) => {
+      vi.stubEnv("PLEX_ENABLE_MUTATIVE_OPS", "true");
+      const updateMetadata = vi.fn().mockResolvedValue({ content: [] });
+      const registry = createPlexToolRegistry({ updateMetadata } as unknown as PlexTools);
+      await registry.handle("update_metadata", { ratingKey: "42", labels });
+      expect(updateMetadata).toHaveBeenCalledWith(expect.objectContaining({ ratingKey: "42", labels }));
+    });
+  });
+
   it("registers and dispatches a handler", async () => {
     const registry = new ToolRegistry();
     const handler = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "ok" }] });

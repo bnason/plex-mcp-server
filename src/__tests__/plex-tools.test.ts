@@ -1111,6 +1111,134 @@ describe("PlexTools", () => {
     });
   });
 
+  describe("labels", () => {
+    beforeEach(() => {
+      vi.stubEnv("PLEX_ENABLE_MUTATIVE_OPS", "true");
+    });
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    function mockLabels(
+      type: string,
+      current: string[],
+      options: { locked?: boolean; failAdd?: boolean } = {}
+    ) {
+      const request = client.makeRequest as ReturnType<typeof vi.fn>;
+      request.mockImplementation(async (endpoint: string, params?: Record<string, string | number>) => {
+        if (endpoint === "/library/metadata/42") {
+          return {
+            MediaContainer: {
+              Metadata: [{
+                type,
+                librarySectionID: 1,
+                Label: current.map((tag) => ({ tag })),
+                Field: options.locked ? [{ name: "label", locked: true }] : [],
+              }],
+            },
+          };
+        }
+        if (options.failAdd && params && "label[0].tag.tag" in params) {
+          throw new Error("Plex returned 500");
+        }
+        return {};
+      });
+      return request;
+    }
+
+    it.each(["movie", "show"])("exposes %s labels in editable fields and details", async (type) => {
+      mockLabels(type, ["Kids", "Family"], { locked: true });
+
+      const fields = parseResponse(await tools.getEditableFields("42"));
+      expect(fields.availableTags.labels).toEqual(["Kids", "Family"]);
+      expect(fields.editableTags).toContain("labels");
+      expect(fields.lockedFields).toEqual(["label"]);
+      const details = parseResponse(await tools.getMediaDetails("42"));
+      expect(details.details.labels).toEqual(["Kids", "Family"]);
+    });
+
+    it("reports an empty label list when Plex omits Label", async () => {
+      (client.makeRequest as ReturnType<typeof vi.fn>).mockResolvedValue({
+        MediaContainer: { Metadata: [{ type: "movie" }] },
+      });
+      expect(parseResponse(await tools.getEditableFields("42")).availableTags.labels).toEqual([]);
+      expect(parseResponse(await tools.getMediaDetails("42")).details.labels).toEqual([]);
+    });
+
+    describe.each([["movie", 1], ["show", 2]] as const)("%s label edits", (type, typeId) => {
+      it("adds and locks labels using indexed tag parameters", async () => {
+        const request = mockLabels(type, []);
+        const result = parseResponse(await tools.updateMetadata({ ratingKey: "42", labels: ["Kids", "Family"] }));
+
+        expect(request).toHaveBeenNthCalledWith(2, "/library/sections/1/all", {
+          id: "42", type: typeId, "label.locked": 1,
+          "label[0].tag.tag": "Kids", "label[1].tag.tag": "Family",
+        }, "PUT");
+        expect(result.updated).toBe(true);
+        expect(result.tagResults).toEqual([{ tag: "label", success: true, added: ["Kids", "Family"], removed: [] }]);
+      });
+
+      it("adds before removing on replacement and retains unchanged labels", async () => {
+        const request = mockLabels(type, ["Old", "Family"]);
+        await tools.updateMetadata({ ratingKey: "42", labels: ["Kids", "Family"] });
+
+        expect(request).toHaveBeenCalledTimes(3);
+        expect(request).toHaveBeenNthCalledWith(2, "/library/sections/1/all", {
+          id: "42", type: typeId, "label.locked": 1, "label[0].tag.tag": "Kids",
+        }, "PUT");
+        expect(request).toHaveBeenNthCalledWith(3, "/library/sections/1/all", {
+          id: "42", type: typeId, "label.locked": 1, "label[].tag.tag-": "Old",
+        }, "PUT");
+      });
+
+      it("clears and unlocks labels with an empty list", async () => {
+        const request = mockLabels(type, ["Kids", "Family"]);
+        const result = parseResponse(await tools.updateMetadata({ ratingKey: "42", labels: [] }));
+
+        expect(request).toHaveBeenCalledTimes(2);
+        expect(request).toHaveBeenNthCalledWith(2, "/library/sections/1/all", {
+          id: "42", type: typeId, "label.locked": 0, "label[].tag.tag-": "Kids,Family",
+        }, "PUT");
+        expect(result.updated).toBe(true);
+      });
+    });
+
+    it("unlocks an already empty locked label field", async () => {
+      const request = mockLabels("movie", [], { locked: true });
+      await tools.updateMetadata({ ratingKey: "42", labels: [] });
+      expect(request).toHaveBeenNthCalledWith(2, "/library/sections/1/all", {
+        id: "42", type: 1, "label.locked": 0,
+      }, "PUT");
+    });
+
+    it("preserves existing labels if adding replacement labels fails", async () => {
+      const request = mockLabels("movie", ["Kids"], { failAdd: true });
+      const result = parseResponse(await tools.updateMetadata({ ratingKey: "42", labels: ["Family"] }));
+      expect(request).toHaveBeenCalledTimes(2);
+      expect(result.updated).toBe(false);
+      expect(result.tagResults[0].removed).toEqual([]);
+      expect(result.tagResults[0].warnings).toContain("Skipped removing label tags because adding the new ones failed");
+    });
+
+    it.each([{ labels: ["Kids"] }, { labels: [] }])("maps JSON label payload $labels", async ({ labels }) => {
+      const request = mockLabels("movie", ["Old"]);
+      const result = parseResponse(await tools.updateMetadataFromJson("42", { labels }));
+      expect(result.updated).toBe(true);
+      expect(result.appliedFields.labels).toEqual(labels);
+      expect(result.ignoredFields).toEqual([]);
+      expect(request).toHaveBeenLastCalledWith("/library/sections/1/all", {
+        id: "42", type: 1, "label.locked": labels.length ? 1 : 0, "label[].tag.tag-": "Old",
+      }, "PUT");
+    });
+
+    it("requires write operations to be enabled for label edits", async () => {
+      vi.stubEnv("PLEX_ENABLE_MUTATIVE_OPS", "false");
+      await expect(tools.updateMetadata({ ratingKey: "42", labels: ["Kids"] })).rejects.toThrow("disabled");
+      expect(client.makeRequest).not.toHaveBeenCalled();
+    });
+  });
+
   describe("updateMetadata tag locks", () => {
     const ORIGINAL_MUTATIVE_ENV = process.env.PLEX_ENABLE_MUTATIVE_OPS;
 
