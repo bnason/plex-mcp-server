@@ -16,6 +16,8 @@ export declare class PlexUsers {
     private client;
     private tokens;
     private machineIdentifier?;
+    private userList?;
+    private ownerName?;
     constructor(client: PlexClient);
     /**
      * The server token for a user, or undefined for the server owner (whose token the

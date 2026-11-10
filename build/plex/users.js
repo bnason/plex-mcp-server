@@ -32,6 +32,8 @@ export class PlexUsers {
     client;
     tokens = new Map();
     machineIdentifier;
+    userList;
+    ownerName;
     constructor(client) {
         this.client = client;
     }
@@ -73,17 +75,26 @@ export class PlexUsers {
     }
     /** The owner's friends and Home users, as plex.tv lists them. */
     async users() {
-        return xmlElements(await this.client.makePlexTvRequest("/api/users"), "User").map((user) => ({
+        if (this.userList && this.userList.until > Date.now())
+            return this.userList.users;
+        const users = xmlElements(await this.client.makePlexTvRequest("/api/users"), "User").map((user) => ({
             id: user.id ?? "",
             title: user.title ?? "",
             username: user.username ?? "",
         })).filter((user) => user.id);
+        this.userList = { users, until: Date.now() + TOKEN_TTL_MS };
+        return users;
     }
     /** Whether the name or id is the server owner (local account 1), who needs no switch. */
     async isOwner(wanted) {
-        const data = (await this.client.makeRequest("/accounts"));
-        const owner = data.MediaContainer?.Account?.find((account) => String(account.id) === "1");
-        return !!owner && (wanted === "1" || (!!owner.name && owner.name.toLowerCase() === wanted.toLowerCase()));
+        if (wanted === "1")
+            return true;
+        if (!this.ownerName || this.ownerName.until <= Date.now()) {
+            const data = (await this.client.makeRequest("/accounts"));
+            const owner = data.MediaContainer?.Account?.find((account) => String(account.id) === "1");
+            this.ownerName = { name: owner?.name ?? "", until: Date.now() + TOKEN_TTL_MS };
+        }
+        return !!this.ownerName.name && this.ownerName.name.toLowerCase() === wanted.toLowerCase();
     }
     async machine() {
         if (this.machineIdentifier)
