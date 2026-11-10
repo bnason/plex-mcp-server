@@ -145,6 +145,22 @@ describe("per-user views", () => {
     expect(parse(await tools.getLibraryItems("1")).items[0].watchStatus).toBe("unwatched");
   });
 
+  it("lists ratings and genres, asks Plex for a lean page, and looks users up once", async () => {
+    fixture = createClient(() => listing([{ ratingKey: "1", title: "Bluey", type: "show", contentRating: "TV-Y", contentRatingAge: 0,
+      Genre: [{ tag: "Animation" }, { tag: "Kids" }], studio: "Ludo", audienceRating: 9.1, leafCount: 10, viewedLeafCount: 0 }]));
+    tools = new PlexTools(fixture.client);
+    const item = parse(await tools.getLibraryItems("2", undefined, 2000, 0, undefined, "Rhett")).items[0];
+    expect(item).toMatchObject({ contentRating: "TV-Y", contentRatingAge: 0, genres: ["Animation", "Kids"], studio: "Ludo", audienceRating: 9.1 });
+    const page = fixture.makeRequest.mock.calls.find(([endpoint]) => endpoint === "/library/sections/2/all")?.[1] as Record<string, unknown>;
+    expect(String(page.excludeElements)).toContain("Role");
+    expect(String(page.excludeElements)).not.toContain("Genre");
+    expect(String(page.excludeElements)).not.toContain("Label");
+    await tools.getLibraryItems("2", undefined, 50, 0, undefined, "Rory");
+    await tools.searchMedia("bluey", undefined, undefined, 10, 0, "Rhett");
+    expect(fixture.makePlexTvRequest.mock.calls.filter(([endpoint]) => endpoint === "/api/users")).toHaveLength(1);
+    expect(fixture.makeRequest.mock.calls.filter(([endpoint]) => endpoint === "/accounts")).toHaveLength(1);
+  });
+
   it("passes user and label through the registry", async () => {
     const registry = createPlexToolRegistry(tools);
     const result = parse(await registry.handle("get_library_items", { libraryKey: "1", user: "Rhett", label: "Rhett" }));

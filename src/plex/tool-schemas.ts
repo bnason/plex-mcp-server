@@ -21,8 +21,9 @@ const GET_LIBRARY_ITEMS_SCHEMA = {
   name: "get_library_items",
   description:
     "List items in a library with pagination (useful for large libraries). " +
-    "Filter by label, or pass user to list what a Home or shared user sees. Each item has watchStatus " +
-    "(watched, partial, unwatched), viewCount and lastViewedAt for the account read (the user's own when user is set).",
+    "Filter by label, or pass user to list what a Home or shared user sees. Each item has contentRating, " +
+    "contentRatingAge, genres, studio, audienceRating, labels and watchStatus (watched, partial, unwatched), viewCount and " +
+    "lastViewedAt for the account read (the user's own when user is set). A whole library fits in one call (limit 2000).",
   inputSchema: {
     type: "object" as const,
     properties: {
