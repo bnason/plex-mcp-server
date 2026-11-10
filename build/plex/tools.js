@@ -91,6 +91,21 @@ function httpStatus(error) {
     const status = error?.response?.status;
     return typeof status === "number" ? status : undefined;
 }
+/**
+ * Helper: an item's watch state for whoever's token read it. Plex keeps watch state
+ * per account, so a listing read as a user carries that user's state.
+ */
+function watchState(item) {
+    const viewCount = typeof item.viewCount === "number" ? item.viewCount : 0;
+    if (typeof item.leafCount === "number") {
+        const watchedEpisodes = item.viewedLeafCount ?? 0;
+        const watchStatus = item.leafCount > 0 && watchedEpisodes >= item.leafCount ? "watched" : watchedEpisodes > 0 ? "partial" : "unwatched";
+        return { watchStatus, watchedEpisodes, episodes: item.leafCount, lastViewedAt: item.lastViewedAt };
+    }
+    const inProgress = typeof item.viewOffset === "number" && item.viewOffset > 0;
+    const watchStatus = viewCount > 0 ? "watched" : inProgress ? "partial" : "unwatched";
+    return { watchStatus, viewCount, lastViewedAt: item.lastViewedAt, ...(inProgress ? { progressPercent: progressPercent(item) } : {}) };
+}
 /** Helper: the tag names of one of an item's tag lists (Label, Genre, ...). */
 function tagNames(value) {
     return Array.isArray(value) ? value.map((tag) => tag.tag).filter((tag) => !!tag) : undefined;
@@ -178,6 +193,7 @@ export class PlexTools {
                 guid: item.guid,
                 editionTitle: item.editionTitle,
                 labels: tagNames(item.Label),
+                ...watchState(item),
             })),
         });
     }
