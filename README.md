@@ -231,7 +231,7 @@ Once configured, you can ask your AI assistant:
 | Function | Description |
 |----------|-------------|
 | `get_libraries` | List all Plex libraries |
-| `get_library_items` | List items in a library with pagination; filter by `label`, or pass `user` to list what that user sees |
+| `get_library_items` | List items in a library with pagination and their watch status; filter by `label`, or pass `user` to list what that user sees and has watched |
 | `export_library` | Export a full library to JSON (under `./exports`) |
 | `search_media` | Search media globally or within one library; `user` searches as that user |
 | `get_recently_added` | Recently added content; pass `type` and `libraryKey` to list e.g. new episodes (TV is otherwise grouped by season) |
@@ -253,7 +253,7 @@ Once configured, you can ask your AI assistant:
 
 `user` takes a Home or shared user's name or plex.tv user id. The server asks plex.tv for that
 user's token for this server and reads with it, so label restrictions, content ratings and shared
-libraries apply exactly as they do for the user. It needs the server owner's token, and the user's
+libraries apply exactly as they do for the user, and watch status is the user's own. It needs the server owner's token, and the user's
 token is never returned. Write tools always act as the configured account.
 
 ### Write Operations (12 tools, opt-in)

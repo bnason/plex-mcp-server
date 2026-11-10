@@ -126,6 +126,25 @@ describe("per-user views", () => {
     expect(String(error)).toContain("Labels: Rhett, Rory");
   });
 
+  it("reports the reading account's watch status for each item", async () => {
+    fixture = createClient((_endpoint, _params, token) =>
+      listing(token === "token-rhett" ? [
+        { ratingKey: "1", title: "Seen", type: "movie", viewCount: 2, lastViewedAt: 1700000000 },
+        { ratingKey: "2", title: "Half", type: "movie", viewOffset: 3000, duration: 6000 },
+        { ratingKey: "3", title: "Fresh", type: "movie" },
+        { ratingKey: "4", title: "Show", type: "show", leafCount: 10, viewedLeafCount: 4, lastViewedAt: 1700000001 },
+        { ratingKey: "5", title: "Done Show", type: "show", leafCount: 3, viewedLeafCount: 3 },
+      ] : [{ ratingKey: "1", title: "Seen", type: "movie" }])
+    );
+    tools = new PlexTools(fixture.client);
+    const items = parse(await tools.getLibraryItems("1", undefined, 50, 0, undefined, "Rhett")).items;
+    expect(items.map((item: { watchStatus: string }) => item.watchStatus)).toEqual(["watched", "partial", "unwatched", "partial", "watched"]);
+    expect(items[0]).toMatchObject({ viewCount: 2, lastViewedAt: 1700000000 });
+    expect(items[1]).toMatchObject({ progressPercent: 50 });
+    expect(items[3]).toMatchObject({ watchedEpisodes: 4, episodes: 10 });
+    expect(parse(await tools.getLibraryItems("1")).items[0].watchStatus).toBe("unwatched");
+  });
+
   it("passes user and label through the registry", async () => {
     const registry = createPlexToolRegistry(tools);
     const result = parse(await registry.handle("get_library_items", { libraryKey: "1", user: "Rhett", label: "Rhett" }));
