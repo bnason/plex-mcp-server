@@ -1,0 +1,313 @@
+/**
+ * MCP tool schema definitions for Sonarr/Radarr tools.
+ * Mirrors the pattern from plex/tool-schemas.ts and trakt/tool-schemas.ts.
+ */
+// ──── Sonarr schemas (12) ────
+export const SONARR_TOOL_SCHEMAS = [
+    {
+        name: "sonarr_get_series",
+        description: "List all series in Sonarr with optional title filter",
+        inputSchema: {
+            type: "object",
+            properties: {
+                filter: { type: "string", description: "Optional title substring filter" },
+                limit: { type: "number", description: "Max results to return (default: 200)", default: 200 },
+            },
+        },
+    },
+    {
+        name: "sonarr_search",
+        description: "Search TheTVDB for new series to add to Sonarr",
+        inputSchema: {
+            type: "object",
+            properties: {
+                query: { type: "string", description: "Search query (series title)" },
+                limit: { type: "number", description: "Max results to return (default: 200)", default: 200 },
+            },
+            required: ["query"],
+        },
+    },
+    {
+        name: "sonarr_add_series",
+        description: "Add a new series to Sonarr by TVDB ID",
+        inputSchema: {
+            type: "object",
+            properties: {
+                tvdbId: { type: "number", description: "TheTVDB ID of the series" },
+                title: { type: "string", description: "Series title" },
+                qualityProfileId: { type: "number", description: "Quality profile ID (auto-detected if omitted)" },
+                rootFolderPath: { type: "string", description: "Root folder path (auto-detected if omitted)" },
+                monitored: { type: "boolean", description: "Whether to monitor the series (default: true)", default: true },
+                seasonFolder: { type: "boolean", description: "Use season folders (default: true)", default: true },
+                monitorType: {
+                    type: "string",
+                    description: "Which episodes to monitor",
+                    enum: [
+                        "all", "future", "missing", "existing", "recent", "pilot", "firstSeason",
+                        "lastSeason", "monitorSpecials", "unmonitorSpecials", "none",
+                    ],
+                    default: "all",
+                },
+                seriesType: {
+                    type: "string",
+                    description: "Series type, used by Sonarr for renaming, parsing and searching (default: standard)",
+                    enum: ["standard", "daily", "anime"],
+                },
+                searchForMissingEpisodes: { type: "boolean", description: "Search for missing episodes after adding (default: true)", default: true },
+                searchForCutoffUnmetEpisodes: { type: "boolean", description: "After adding, search for upgrades to monitored episodes whose existing files are below the quality profile's cutoff; no effect without files on disk (default: false)", default: false },
+                tags: {
+                    type: "array",
+                    items: { type: "string" },
+                    description: "Tag labels to assign; labels that do not exist yet are created first (existing tags: sonarr_get_tags)",
+                },
+            },
+            required: ["tvdbId", "title"],
+        },
+    },
+    {
+        name: "sonarr_get_missing",
+        description: "Get missing/wanted episodes from Sonarr",
+        inputSchema: {
+            type: "object",
+            properties: {
+                page: { type: "number", description: "Page number (default: 1)", default: 1 },
+                pageSize: { type: "number", description: "Items per page (default: 200)", default: 200 },
+            },
+        },
+    },
+    {
+        name: "sonarr_get_queue",
+        description: "Get the current Sonarr download queue",
+        inputSchema: {
+            type: "object",
+            properties: {
+                limit: { type: "number", description: "Max results to return (default: 200)", default: 200 },
+            },
+        },
+    },
+    {
+        name: "sonarr_get_calendar",
+        description: "Get upcoming episodes from the Sonarr calendar",
+        inputSchema: {
+            type: "object",
+            properties: {
+                startDate: { type: "string", description: "Start date (YYYY-MM-DD, default: 7 days ago)" },
+                endDate: { type: "string", description: "End date (YYYY-MM-DD, default: 30 days from now)" },
+                limit: { type: "number", description: "Max results to return (default: 200)", default: 200 },
+            },
+        },
+    },
+    {
+        name: "sonarr_get_profiles",
+        description: "Get Sonarr quality profiles and root folders (needed before adding series)",
+        inputSchema: { type: "object", properties: {} },
+    },
+    {
+        name: "sonarr_trigger_search",
+        description: "Trigger a search for missing episodes, optionally for a specific series",
+        inputSchema: {
+            type: "object",
+            properties: {
+                seriesId: { type: "number", description: "Sonarr series ID (omit to search all missing)" },
+            },
+        },
+    },
+    {
+        name: "sonarr_get_tags",
+        description: "List all Sonarr tags with their IDs and labels",
+        inputSchema: { type: "object", properties: {} },
+    },
+    {
+        name: "sonarr_create_tag",
+        description: "Create a new Sonarr tag",
+        inputSchema: {
+            type: "object",
+            properties: {
+                label: { type: "string", description: "Tag label" },
+            },
+            required: ["label"],
+        },
+    },
+    {
+        name: "sonarr_update_tag",
+        description: "Rename an existing Sonarr tag",
+        inputSchema: {
+            type: "object",
+            properties: {
+                id: { type: "number", description: "Tag ID (from sonarr_get_tags)" },
+                label: { type: "string", description: "New tag label" },
+            },
+            required: ["id", "label"],
+        },
+    },
+    {
+        name: "sonarr_delete_tag",
+        description: "Delete a Sonarr tag by ID",
+        inputSchema: {
+            type: "object",
+            properties: {
+                id: { type: "number", description: "Tag ID (from sonarr_get_tags)" },
+            },
+            required: ["id"],
+        },
+    },
+];
+// ──── Radarr schemas (12) ────
+export const RADARR_TOOL_SCHEMAS = [
+    {
+        name: "radarr_get_movies",
+        description: "List all movies in Radarr with optional title filter",
+        inputSchema: {
+            type: "object",
+            properties: {
+                filter: { type: "string", description: "Optional title substring filter" },
+                limit: { type: "number", description: "Max results to return (default: 200)", default: 200 },
+            },
+        },
+    },
+    {
+        name: "radarr_search",
+        description: "Search TMDB for new movies to add to Radarr",
+        inputSchema: {
+            type: "object",
+            properties: {
+                query: { type: "string", description: "Search query (movie title)" },
+                limit: { type: "number", description: "Max results to return (default: 200)", default: 200 },
+            },
+            required: ["query"],
+        },
+    },
+    {
+        name: "radarr_add_movie",
+        description: "Add a new movie to Radarr by TMDB ID",
+        inputSchema: {
+            type: "object",
+            properties: {
+                tmdbId: { type: "number", description: "The Movie Database (TMDB) ID" },
+                title: { type: "string", description: "Movie title" },
+                qualityProfileId: { type: "number", description: "Quality profile ID (auto-detected if omitted)" },
+                rootFolderPath: { type: "string", description: "Root folder path (auto-detected if omitted)" },
+                monitored: { type: "boolean", description: "Whether to monitor the movie (default: true)", default: true },
+                minimumAvailability: {
+                    type: "string",
+                    description: "When the movie is considered available",
+                    enum: ["announced", "inCinemas", "released"],
+                    default: "released",
+                },
+                monitorType: {
+                    type: "string",
+                    description: "What to monitor (default: movieOnly). movieAndCollection also adds and monitors every other movie in its collection; monitored and searchForMovie apply only to this movie. Does not change monitored: pass monitored: false to leave the movie itself unmonitored",
+                    enum: ["movieOnly", "movieAndCollection", "none"],
+                },
+                searchForMovie: { type: "boolean", description: "Search for the movie after adding (default: true)", default: true },
+                tags: {
+                    type: "array",
+                    items: { type: "string" },
+                    description: "Tag labels to assign; labels that do not exist yet are created first (existing tags: radarr_get_tags)",
+                },
+            },
+            required: ["tmdbId", "title"],
+        },
+    },
+    {
+        name: "radarr_get_missing",
+        description: "Get missing/wanted movies from Radarr",
+        inputSchema: {
+            type: "object",
+            properties: {
+                page: { type: "number", description: "Page number (default: 1)", default: 1 },
+                pageSize: { type: "number", description: "Items per page (default: 200)", default: 200 },
+            },
+        },
+    },
+    {
+        name: "radarr_get_queue",
+        description: "Get the current Radarr download queue",
+        inputSchema: {
+            type: "object",
+            properties: {
+                limit: { type: "number", description: "Max results to return (default: 200)", default: 200 },
+            },
+        },
+    },
+    {
+        name: "radarr_get_calendar",
+        description: "Get upcoming movies from the Radarr calendar",
+        inputSchema: {
+            type: "object",
+            properties: {
+                startDate: { type: "string", description: "Start date (YYYY-MM-DD, default: 7 days ago)" },
+                endDate: { type: "string", description: "End date (YYYY-MM-DD, default: 30 days from now)" },
+                limit: { type: "number", description: "Max results to return (default: 200)", default: 200 },
+            },
+        },
+    },
+    {
+        name: "radarr_get_profiles",
+        description: "Get Radarr quality profiles and root folders (needed before adding movies)",
+        inputSchema: { type: "object", properties: {} },
+    },
+    {
+        name: "radarr_trigger_search",
+        description: "Trigger a search for missing movies, optionally for a specific movie",
+        inputSchema: {
+            type: "object",
+            properties: {
+                movieId: { type: "number", description: "Radarr movie ID (omit to search all missing)" },
+            },
+        },
+    },
+    {
+        name: "radarr_get_tags",
+        description: "List all Radarr tags with their IDs and labels",
+        inputSchema: { type: "object", properties: {} },
+    },
+    {
+        name: "radarr_create_tag",
+        description: "Create a new Radarr tag",
+        inputSchema: {
+            type: "object",
+            properties: {
+                label: { type: "string", description: "Tag label" },
+            },
+            required: ["label"],
+        },
+    },
+    {
+        name: "radarr_update_tag",
+        description: "Rename an existing Radarr tag",
+        inputSchema: {
+            type: "object",
+            properties: {
+                id: { type: "number", description: "Tag ID (from radarr_get_tags)" },
+                label: { type: "string", description: "New tag label" },
+            },
+            required: ["id", "label"],
+        },
+    },
+    {
+        name: "radarr_delete_tag",
+        description: "Delete a Radarr tag by ID",
+        inputSchema: {
+            type: "object",
+            properties: {
+                id: { type: "number", description: "Tag ID (from radarr_get_tags)" },
+            },
+            required: ["id"],
+        },
+    },
+];
+// ──── Cross-service schemas (1) ────
+export const ARR_CROSS_TOOL_SCHEMAS = [
+    {
+        name: "arr_get_status",
+        description: "Check connection status of Sonarr and Radarr services",
+        inputSchema: { type: "object", properties: {} },
+    },
+];
+/** All 25 Arr tool schemas */
+export const ARR_TOOL_SCHEMAS = [
+    ...SONARR_TOOL_SCHEMAS,
+    ...RADARR_TOOL_SCHEMAS,
+    ...ARR_CROSS_TOOL_SCHEMAS,
+];

@@ -1,0 +1,1916 @@
+/**
+ * Plex tool implementations.
+ * All Plex MCP tools with typed args and no `as any` casts.
+ */
+import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
+import { createWriteStream } from "node:fs";
+import { mkdir, rm } from "node:fs/promises";
+import path from "node:path";
+import { DEFAULT_LIMITS, PLEX_CONTAINER_SIZE, PLEX_FILTERED_SCAN_MAX_PAGES, SUMMARY_PREVIEW_LENGTH, PLEX_MUTATIVE_OPS_ENV_VAR, isMutativeOpsEnabled, isContentCompleted, RECENCY_HALF_LIFE_DAYS, TASTE_TOP_ACTORS, MIN_WATCHED_FOR_RECOMMENDATIONS, SMART_PLAYLIST_LIBTYPE_IDS, PLEX_TAGGABLE_TYPE_IDS, } from "./constants.js";
+import { truncate, validatePlexId, sanitizeSearchQuery, validatePlexMediaContainer, validatePlexTotalSize } from "../shared/utils.js";
+import { formatToolPayload } from "../shared/output-format.js";
+/**
+ * Helper: the paging pair for a request that wants the first `size` items.
+ * Plex ignores X-Plex-Container-Size unless X-Plex-Container-Start is sent with it.
+ */
+function firstPage(size) {
+    return { "X-Plex-Container-Start": 0, "X-Plex-Container-Size": size };
+}
+/** Helper: wrap a JSON value as an MCP text response */
+function jsonResponse(data) {
+    return { content: [{ type: "text", text: formatToolPayload(data, 2) }] };
+}
+/** Helper: "/library/metadata/32820" -> "32820"; undefined for any other shape. */
+function ratingKeyFromKey(key) {
+    return typeof key === "string" ? key.match(/^\/library\/metadata\/(\d+)$/)?.[1] : undefined;
+}
+/**
+ * Helper: the fields that tie an episode or season to its show.
+ * Plex's raw parent/grandparent fields change meaning with the item type
+ * (an episode's parentTitle is "Season 1", a season's is the show name), so
+ * they are normalised here. Empty for movies and shows, so nothing is added.
+ */
+function showContext(item) {
+    if (item.type === "episode") {
+        return {
+            showTitle: item.grandparentTitle,
+            // History entries carry grandparentKey ("/library/metadata/<id>") but no grandparentRatingKey.
+            showRatingKey: item.grandparentRatingKey ?? ratingKeyFromKey(item.grandparentKey),
+            seasonNumber: item.parentIndex,
+            episodeNumber: item.index,
+        };
+    }
+    if (item.type === "season") {
+        return {
+            showTitle: item.parentTitle,
+            showRatingKey: item.parentRatingKey,
+            seasonNumber: item.index,
+        };
+    }
+    return {};
+}
+/**
+ * Helper: whether a result of the unwatched=0 query is fully watched.
+ * Plex is exact for items without children (movies, episodes). It also lets
+ * partly watched shows and seasons through, and those carry leafCount and
+ * viewedLeafCount, so they are checked here.
+ */
+function isFullyWatched(item) {
+    if (typeof item.leafCount !== "number")
+        return true;
+    return item.leafCount > 0 && (item.viewedLeafCount ?? 0) >= item.leafCount;
+}
+/**
+ * Helper: percent watched for a library item. Uses the playback offset when there is
+ * one; shows and seasons have none, so they use the share of episodes watched. Items
+ * with neither are finished, since Plex omits viewOffset once something is watched.
+ */
+function progressPercent(item) {
+    if (item.viewOffset && item.duration) {
+        return Math.round((item.viewOffset / item.duration) * 100);
+    }
+    if (typeof item.leafCount === "number" && item.leafCount > 0) {
+        return Math.round(((item.viewedLeafCount ?? 0) / item.leafCount) * 100);
+    }
+    return 100;
+}
+/** The history row type each history filter matches. TV shows appear as their episodes. */
+const HISTORY_ROW_TYPES = { movie: "movie", show: "episode", episode: "episode", track: "track" };
+/** Helper: the history row type for a mediaType, or undefined for "all". Throws on anything else. */
+function historyRowType(mediaType) {
+    if (mediaType === "all")
+        return undefined;
+    if (!Object.hasOwn(HISTORY_ROW_TYPES, mediaType)) {
+        throw new Error(`Unknown media type "${mediaType}" for watch history. Expected one of: all, ${Object.keys(HISTORY_ROW_TYPES).join(", ")}`);
+    }
+    return HISTORY_ROW_TYPES[mediaType];
+}
+export class PlexTools {
+    client;
+    machineIdentifier;
+    constructor(client) {
+        this.client = client;
+    }
+    // ── Core tools ──────────────────────────────────────────────
+    async getLibraries() {
+        const data = await this.client.makeRequest("/library/sections");
+        const validated = validatePlexMediaContainer(data);
+        const libraries = validated.MediaContainer?.Directory || [];
+        return jsonResponse({
+            libraries: libraries.map((lib) => ({
+                key: lib.key,
+                title: lib.title,
+                type: lib.type,
+                scannedAt: lib.scannedAt,
+                count: lib.count,
+            })),
+        });
+    }
+    async getLibraryItems(libraryKey, type, limit = DEFAULT_LIMITS.libraryItems, offset = 0, sort) {
+        validatePlexId(libraryKey, "libraryKey");
+        const safeLimit = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : DEFAULT_LIMITS.libraryItems;
+        const safeOffset = Number.isFinite(offset) && offset >= 0 ? Math.floor(offset) : 0;
+        const params = {
+            "X-Plex-Container-Start": safeOffset,
+            "X-Plex-Container-Size": safeLimit,
+        };
+        if (type) {
+            params.type = this.client.getPlexTypeId(type);
+        }
+        if (sort) {
+            params.sort = sort;
+        }
+        const data = await this.client.makeRequest(`/library/sections/${libraryKey}/all`, params);
+        const container = validatePlexTotalSize(data);
+        const items = container.MediaContainer?.Metadata || [];
+        const totalSize = container.MediaContainer?.totalSize || 0;
+        // Defensive: warn if offset exceeds total size
+        const warning = safeOffset > totalSize
+            ? `offset (${safeOffset}) exceeds total size (${totalSize}); returning empty results`
+            : undefined;
+        return jsonResponse({
+            libraryKey,
+            offset: safeOffset,
+            limit: safeLimit,
+            totalSize,
+            ...(warning ? { warning } : {}),
+            items: items.map((item) => ({
+                ratingKey: item.ratingKey,
+                title: item.title,
+                originalTitle: item.originalTitle,
+                year: item.year,
+                type: item.type,
+                ...showContext(item),
+                guid: item.guid,
+                editionTitle: item.editionTitle,
+            })),
+        });
+    }
+    async exportLibrary(libraryKey, type, outputPath, pageSize = DEFAULT_LIMITS.exportPageSize) {
+        validatePlexId(libraryKey, "libraryKey");
+        const baseExportDir = path.resolve(process.cwd(), "exports");
+        let exportPath;
+        if (outputPath) {
+            if (path.isAbsolute(outputPath)) {
+                throw new McpError(ErrorCode.InvalidRequest, "Absolute paths are not allowed for outputPath");
+            }
+            const resolvedPath = path.resolve(baseExportDir, outputPath);
+            const basePrefix = `${baseExportDir}${path.sep}`;
+            if (resolvedPath !== baseExportDir && !resolvedPath.startsWith(basePrefix)) {
+                throw new McpError(ErrorCode.InvalidRequest, "outputPath must be within the exports directory and must not contain path traversal");
+            }
+            exportPath = resolvedPath;
+        }
+        else {
+            exportPath = path.join(baseExportDir, `library_${libraryKey}_${Date.now()}.json`);
+        }
+        await mkdir(path.dirname(exportPath), { recursive: true });
+        const safePageSize = Number.isFinite(pageSize) && pageSize > 0 ? Math.floor(pageSize) : DEFAULT_LIMITS.exportPageSize;
+        const stream = createWriteStream(exportPath, { encoding: "utf8" });
+        let streamError = null;
+        stream.once("error", (error) => {
+            streamError = error;
+        });
+        let offset = 0;
+        let totalSize = 0;
+        let totalExported = 0;
+        let isFirst = true;
+        try {
+            await this.writeToStream(stream, "[\n");
+            while (true) {
+                const params = {
+                    "X-Plex-Container-Start": offset,
+                    "X-Plex-Container-Size": safePageSize,
+                };
+                if (type) {
+                    params.type = this.client.getPlexTypeId(type);
+                }
+                const data = await this.client.makeRequest(`/library/sections/${libraryKey}/all`, params);
+                const container = data;
+                const items = container.MediaContainer?.Metadata || [];
+                totalSize = typeof container.MediaContainer?.totalSize === "number" ? container.MediaContainer.totalSize : totalSize;
+                for (const item of items) {
+                    if (!isFirst) {
+                        await this.writeToStream(stream, ",\n");
+                    }
+                    await this.writeToStream(stream, JSON.stringify({
+                        ratingKey: item.ratingKey,
+                        title: item.title,
+                        year: item.year,
+                        type: item.type,
+                        ...showContext(item),
+                        guid: item.guid,
+                        originalTitle: item.originalTitle,
+                        editionTitle: item.editionTitle,
+                    }));
+                    isFirst = false;
+                    totalExported += 1;
+                }
+                offset += items.length;
+                if (items.length === 0 || (totalSize > 0 && offset >= totalSize)) {
+                    break;
+                }
+            }
+            await this.writeToStream(stream, "\n]\n");
+            await this.finishStream(stream);
+        }
+        catch (error) {
+            stream.destroy();
+            await rm(exportPath, { force: true }).catch(() => undefined);
+            if (error instanceof McpError) {
+                throw error;
+            }
+            const message = this.getErrorMessage(streamError || error);
+            throw new McpError(ErrorCode.InternalError, `Failed to export library: ${message}`);
+        }
+        return jsonResponse({
+            exported: true,
+            libraryKey,
+            type: type || "all",
+            outputPath: exportPath,
+            totalExported,
+            totalSize: totalSize || totalExported,
+        });
+    }
+    async searchMedia(query, type, libraryKey, limit = DEFAULT_LIMITS.searchMedia, offset = 0) {
+        const sanitizedQuery = sanitizeSearchQuery(query);
+        const safeLimit = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : DEFAULT_LIMITS.searchMedia;
+        const safeOffset = Number.isFinite(offset) && offset >= 0 ? Math.floor(offset) : 0;
+        const params = {
+            query: sanitizedQuery,
+            "X-Plex-Container-Start": safeOffset,
+            "X-Plex-Container-Size": safeLimit,
+        };
+        if (type) {
+            params.type = this.client.getPlexTypeId(type);
+        }
+        if (libraryKey) {
+            validatePlexId(libraryKey, "libraryKey");
+        }
+        const endpoint = libraryKey ? `/library/sections/${libraryKey}/search` : "/search";
+        const data = await this.client.makeRequest(endpoint, params);
+        const container = data;
+        const results = container.MediaContainer?.Metadata || [];
+        return jsonResponse({
+            query: sanitizedQuery,
+            libraryKey: libraryKey || "all",
+            offset: safeOffset,
+            limit: safeLimit,
+            results: results.map((item) => ({
+                ratingKey: item.ratingKey,
+                title: item.title,
+                type: item.type,
+                ...showContext(item),
+                year: item.year,
+                summary: item.summary ? truncate(String(item.summary), SUMMARY_PREVIEW_LENGTH) : undefined,
+                rating: item.rating,
+            })),
+        });
+    }
+    async getPlaylists() {
+        const data = await this.client.makeRequest("/playlists");
+        const container = data;
+        const playlists = container.MediaContainer?.Metadata || [];
+        return jsonResponse({
+            playlists: playlists.map((playlist) => ({
+                ratingKey: playlist.ratingKey,
+                key: playlist.key,
+                title: playlist.title,
+                type: playlist.type,
+                playlistType: playlist.playlistType,
+                smart: playlist.smart,
+                leafCount: playlist.leafCount,
+                duration: playlist.duration,
+                summary: playlist.summary ? truncate(String(playlist.summary), SUMMARY_PREVIEW_LENGTH) : undefined,
+                updatedAt: playlist.updatedAt,
+                addedAt: playlist.addedAt,
+            })),
+        });
+    }
+    async getPlaylistItems(playlistId) {
+        validatePlexId(playlistId, "playlistId");
+        const data = await this.client.makeRequest(`/playlists/${playlistId}/items`);
+        const container = data;
+        const items = container.MediaContainer?.Metadata || [];
+        return jsonResponse({
+            playlistId,
+            items: items.map((item) => ({
+                playlistItemID: item.playlistItemID,
+                ratingKey: item.ratingKey,
+                title: item.title,
+                type: item.type,
+                ...showContext(item),
+                year: item.year,
+                duration: item.duration,
+                summary: item.summary ? truncate(String(item.summary), SUMMARY_PREVIEW_LENGTH) : undefined,
+            })),
+        });
+    }
+    async getWatchlist() {
+        const data = await this.client.makeDiscoverRequest("/library/sections/watchlist/all", { includeCollections: 1, includeExternalMedia: 1 }, "GET");
+        const container = data;
+        const watchlist = container.MediaContainer?.Metadata || [];
+        return jsonResponse({
+            watchlist: watchlist.map((item) => ({
+                ratingKey: item.ratingKey,
+                guid: item.guid,
+                title: item.title,
+                type: item.type,
+                year: item.year,
+                summary: item.summary ? truncate(String(item.summary), SUMMARY_PREVIEW_LENGTH) : undefined,
+                addedAt: item.watchlistedAt ?? item.addedAt,
+            })),
+            source: "Plex Discover account watchlist",
+        });
+    }
+    async getEditableFields(ratingKey) {
+        validatePlexId(ratingKey, "ratingKey");
+        const data = await this.client.makeRequest(`/library/metadata/${ratingKey}`);
+        const container = data;
+        const item = container.MediaContainer?.Metadata?.[0];
+        if (!item) {
+            throw new McpError(ErrorCode.InvalidRequest, `Media item not found: ${ratingKey}`);
+        }
+        const availableTags = {
+            genres: item.Genre?.map((g) => g.tag) || [],
+            collections: item.Collection?.map((c) => c.tag) || [],
+            roles: item.Role?.map((r) => r.tag) || [],
+            directors: item.Director?.map((d) => d.tag) || [],
+            labels: item.Label?.map((l) => l.tag) || [],
+        };
+        const editableFields = [
+            "title",
+            "sortTitle",
+            "originalTitle",
+            "summary",
+            "year",
+            "contentRating",
+            "rating",
+            "tagline",
+            "studio",
+        ];
+        const editableTags = Object.keys(availableTags).filter((key) => availableTags[key].length > 0);
+        // Plex lists a field in `Field` only while it is locked against metadata refreshes.
+        const lockedFields = (item.Field ?? [])
+            .filter((field) => field.locked && field.name)
+            .map((field) => field.name);
+        return jsonResponse({
+            ratingKey,
+            type: item.type,
+            title: item.title,
+            librarySectionID: item.librarySectionID,
+            editableFields,
+            editableTags,
+            availableTags,
+            lockedFields,
+            notes: [
+                "Roles/directors availability depends on agent/library type.",
+                "If a tag array is empty, Plex likely won't accept edits for that tag type.",
+                "lockedFields uses Plex's own field names (e.g. genre, collection) and lists only fields locked against metadata refreshes.",
+            ],
+        });
+    }
+    async getRecentlyAdded(limit = DEFAULT_LIMITS.recentlyAdded, type, libraryKey) {
+        if (Boolean(type) !== Boolean(libraryKey)) {
+            throw new McpError(ErrorCode.InvalidRequest, "type and libraryKey must be given together to list recently added items of one type");
+        }
+        const safeLimit = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : DEFAULT_LIMITS.recentlyAdded;
+        const params = {
+            "X-Plex-Container-Start": 0,
+            "X-Plex-Container-Size": safeLimit,
+        };
+        let endpoint = "/library/recentlyAdded";
+        if (type && libraryKey) {
+            // /library/recentlyAdded groups episodes under their season and sorts by the season's addedAt,
+            // so a new episode of an existing season never shows up. Listing one type sorts by its own addedAt.
+            validatePlexId(libraryKey, "libraryKey");
+            endpoint = `/library/sections/${libraryKey}/all`;
+            params.type = this.client.getPlexTypeId(type);
+            params.sort = "addedAt:desc";
+        }
+        const data = await this.client.makeRequest(endpoint, params);
+        const container = data;
+        const items = container.MediaContainer?.Metadata || [];
+        return jsonResponse({
+            recentlyAdded: items.map((item) => ({
+                ratingKey: item.ratingKey,
+                title: item.title,
+                type: item.type,
+                ...showContext(item),
+                year: item.year,
+                addedAt: item.addedAt,
+                summary: item.summary ? truncate(String(item.summary), SUMMARY_PREVIEW_LENGTH) : undefined,
+            })),
+        });
+    }
+    async getOnDeck() {
+        const data = await this.client.makeRequest("/library/onDeck");
+        const container = data;
+        const items = container.MediaContainer?.Metadata || [];
+        return jsonResponse({
+            onDeck: items.map((item) => ({
+                ratingKey: item.ratingKey,
+                title: item.title,
+                type: item.type,
+                ...showContext(item),
+                viewOffset: item.viewOffset,
+                duration: item.duration,
+                lastViewedAt: item.lastViewedAt,
+            })),
+        });
+    }
+    async getActiveSessions() {
+        const data = await this.client.makeRequest("/status/sessions");
+        const container = data;
+        const items = container.MediaContainer?.Metadata ?? [];
+        return jsonResponse({
+            activeSessions: items.map((item) => {
+                // Plex returns Media as a list (python-plexapi: "media (List<Media>)").
+                // The first entry describes the stream actually being played.
+                const media = item.Media?.[0];
+                const player = item.Player;
+                const session = item.Session;
+                const transcode = item.TranscodeSession;
+                return {
+                    ratingKey: item.ratingKey,
+                    sessionKey: item.sessionKey,
+                    title: item.title,
+                    type: item.type,
+                    grandparentTitle: item.grandparentTitle,
+                    parentTitle: item.parentTitle,
+                    summary: item.summary
+                        ? truncate(String(item.summary), SUMMARY_PREVIEW_LENGTH)
+                        : undefined,
+                    duration: item.duration,
+                    viewOffset: item.viewOffset,
+                    user: item.User?.title ?? null,
+                    player: player
+                        ? { title: player.title, state: player.state, platform: player.platform }
+                        : null,
+                    session: session ? { location: session.location } : null,
+                    transcode: transcode
+                        ? {
+                            videoDecision: transcode.videoDecision,
+                            audioDecision: transcode.audioDecision,
+                        }
+                        : null,
+                    media: media
+                        ? {
+                            videoResolution: media.videoResolution,
+                            videoCodec: media.videoCodec,
+                            audioCodec: media.audioCodec,
+                        }
+                        : null,
+                };
+            }),
+            // Derived from what we actually return — MediaContainer.size can be
+            // stale or reflect paging rather than the sessions in this payload.
+            sessionCount: items.length,
+        });
+    }
+    async getMediaDetails(ratingKey) {
+        validatePlexId(ratingKey, "ratingKey");
+        const data = await this.client.makeRequest(`/library/metadata/${ratingKey}`);
+        const container = data;
+        const item = container.MediaContainer?.Metadata?.[0];
+        if (!item) {
+            throw new McpError(ErrorCode.InvalidRequest, `Media item not found: ${ratingKey}`);
+        }
+        return jsonResponse({
+            details: {
+                ratingKey: item.ratingKey,
+                title: item.title,
+                type: item.type,
+                ...showContext(item),
+                year: item.year,
+                summary: item.summary,
+                rating: item.rating,
+                duration: item.duration,
+                labels: item.Label?.map((l) => l.tag) || [],
+                genres: item.Genre?.map((g) => g.tag) || [],
+                actors: item.Role?.map((r) => r.tag) || [],
+                directors: item.Director?.map((d) => d.tag) || [],
+                writers: item.Writer?.map((w) => w.tag) || [],
+                studios: item.Studio?.map((s) => s.tag) || [],
+                addedAt: item.addedAt,
+                updatedAt: item.updatedAt,
+                viewCount: item.viewCount,
+                lastViewedAt: item.lastViewedAt,
+            },
+        });
+    }
+    // ── Mutative tools (opt-in) ─────────────────────────────────
+    async updateMetadata(input) {
+        this.requireMutativeOpsEnabled("update_metadata");
+        validatePlexId(input.ratingKey, "ratingKey");
+        const params = {};
+        if (input.title !== undefined)
+            params.title = input.title;
+        if (input.sortTitle !== undefined)
+            params.titleSort = input.sortTitle;
+        if (input.originalTitle !== undefined)
+            params.originalTitle = input.originalTitle;
+        if (input.summary !== undefined)
+            params.summary = input.summary;
+        if (input.year !== undefined)
+            params.year = input.year;
+        if (input.contentRating !== undefined)
+            params.contentRating = input.contentRating;
+        if (input.rating !== undefined)
+            params.rating = input.rating;
+        if (input.tagline !== undefined)
+            params.tagline = input.tagline;
+        if (input.studio !== undefined)
+            params.studio = input.studio;
+        const tagInputs = {
+            genres: this.normalizeTagList(input.genres),
+            collections: this.normalizeTagList(input.collections),
+            roles: this.normalizeTagList(input.roles),
+            directors: this.normalizeTagList(input.directors),
+            labels: this.normalizeTagList(input.labels),
+        };
+        const hasTagUpdates = input.genres !== undefined ||
+            input.collections !== undefined ||
+            input.roles !== undefined ||
+            input.directors !== undefined ||
+            input.labels !== undefined;
+        if (Object.keys(params).length === 0 && !hasTagUpdates) {
+            throw new McpError(ErrorCode.InvalidRequest, "At least one metadata field must be provided");
+        }
+        const warnings = [];
+        let anySuccess = false;
+        if (Object.keys(params).length > 0) {
+            try {
+                await this.client.makeRequest(`/library/metadata/${input.ratingKey}`, params, "PUT");
+                anySuccess = true;
+            }
+            catch (error) {
+                warnings.push(`Basic metadata update failed: ${this.getErrorMessage(error)}`);
+            }
+        }
+        const tagResults = [];
+        if (hasTagUpdates) {
+            if (input.genres !== undefined) {
+                const result = await this.replaceTagsSafely(input.ratingKey, "genre", tagInputs.genres);
+                if (result.success)
+                    anySuccess = true;
+                tagResults.push(result);
+            }
+            if (input.collections !== undefined) {
+                const result = await this.replaceTagsSafely(input.ratingKey, "collection", tagInputs.collections);
+                if (result.success)
+                    anySuccess = true;
+                tagResults.push(result);
+            }
+            if (input.roles !== undefined) {
+                const result = await this.replaceTagsSafely(input.ratingKey, "role", tagInputs.roles);
+                if (result.success)
+                    anySuccess = true;
+                tagResults.push(result);
+            }
+            if (input.directors !== undefined) {
+                const result = await this.replaceTagsSafely(input.ratingKey, "director", tagInputs.directors);
+                if (result.success)
+                    anySuccess = true;
+                tagResults.push(result);
+            }
+            if (input.labels !== undefined) {
+                const result = await this.replaceTagsSafely(input.ratingKey, "label", tagInputs.labels);
+                if (result.success)
+                    anySuccess = true;
+                tagResults.push(result);
+            }
+        }
+        return jsonResponse({
+            updated: anySuccess,
+            ratingKey: input.ratingKey,
+            fields: params,
+            tagResults: tagResults.length > 0 ? tagResults : undefined,
+            warnings: warnings.length > 0 ? warnings : undefined,
+        });
+    }
+    async updateMetadataFromJson(ratingKey, metadata, setPosterFromUrl = false) {
+        this.requireMutativeOpsEnabled("update_metadata_from_json");
+        validatePlexId(ratingKey, "ratingKey");
+        if (!metadata || typeof metadata !== "object") {
+            throw new McpError(ErrorCode.InvalidRequest, "metadata object is required");
+        }
+        const mapped = { ratingKey };
+        const normalizeNullable = (value) => (value === null ? undefined : value);
+        if ("title" in metadata)
+            mapped.title = normalizeNullable(metadata.title);
+        if ("sortTitle" in metadata)
+            mapped.sortTitle = normalizeNullable(metadata.sortTitle);
+        if ("originalTitle" in metadata) {
+            mapped.originalTitle = normalizeNullable(metadata.originalTitle);
+        }
+        if ("summary" in metadata)
+            mapped.summary = normalizeNullable(metadata.summary);
+        if ("year" in metadata && metadata.year !== null && metadata.year !== undefined)
+            mapped.year = metadata.year;
+        if ("contentRating" in metadata) {
+            mapped.contentRating = normalizeNullable(metadata.contentRating);
+        }
+        if ("rating" in metadata && metadata.rating !== null && metadata.rating !== undefined)
+            mapped.rating = metadata.rating;
+        if ("tagline" in metadata)
+            mapped.tagline = normalizeNullable(metadata.tagline);
+        if ("studio" in metadata)
+            mapped.studio = normalizeNullable(metadata.studio);
+        if ("genres" in metadata)
+            mapped.genres = metadata.genres;
+        if ("collections" in metadata)
+            mapped.collections = metadata.collections;
+        if ("roles" in metadata)
+            mapped.roles = metadata.roles;
+        if ("directors" in metadata)
+            mapped.directors = metadata.directors;
+        if ("labels" in metadata)
+            mapped.labels = metadata.labels;
+        const warnings = [];
+        let metadataUpdated = false;
+        let posterUpdated = false;
+        try {
+            const response = await this.updateMetadata(mapped);
+            const parsed = this.parseResponseText(response);
+            metadataUpdated = Boolean(parsed && parsed.updated);
+        }
+        catch (error) {
+            warnings.push(`Update failed: ${this.getErrorMessage(error)}`);
+        }
+        if (setPosterFromUrl) {
+            const posterUrl = metadata.images?.posters?.[0]?.url;
+            if (!posterUrl) {
+                warnings.push("Poster update skipped: metadata.images.posters[0].url not found");
+            }
+            else {
+                const posterResult = await this.setPosterFromUrl(ratingKey, posterUrl);
+                posterUpdated = posterResult.success;
+                if (posterResult.error) {
+                    warnings.push(posterResult.error);
+                }
+            }
+        }
+        const supportedKeys = new Set([
+            "title",
+            "sortTitle",
+            "originalTitle",
+            "summary",
+            "year",
+            "contentRating",
+            "rating",
+            "tagline",
+            "studio",
+            "genres",
+            "collections",
+            "roles",
+            "directors",
+            "labels",
+            "images",
+        ]);
+        const ignoredFields = Object.keys(metadata).filter((key) => !supportedKeys.has(key));
+        return jsonResponse({
+            updated: metadataUpdated || posterUpdated,
+            ratingKey,
+            appliedFields: Object.fromEntries(Object.entries(mapped).filter(([key]) => key !== "ratingKey")),
+            ignoredFields,
+            warnings: warnings.length > 0 ? warnings : undefined,
+        });
+    }
+    async createPlaylist(title, type, options = {}) {
+        this.requireMutativeOpsEnabled("create_playlist");
+        if (!title) {
+            throw new McpError(ErrorCode.InvalidRequest, "title is required");
+        }
+        if (!type) {
+            throw new McpError(ErrorCode.InvalidRequest, "type is required");
+        }
+        const { ratingKeys, smart, librarySectionId, libtype, smartFilter } = options;
+        const isSmart = smart === true;
+        // Reject mixing modes — Plex treats these as distinct creation paths.
+        if (isSmart && ratingKeys && ratingKeys.length > 0) {
+            throw new McpError(ErrorCode.InvalidRequest, "smart and ratingKeys are mutually exclusive; cannot specify both when creating a playlist");
+        }
+        const playlistType = this.getPlaylistType(type);
+        const machineIdentifier = await this.getMachineIdentifier();
+        const uriRoot = `server://${machineIdentifier}/com.plexapp.plugins.library`;
+        let uri;
+        if (isSmart) {
+            // Smart playlist — requires a library section to filter against.
+            // Plex does not support creating a smart playlist without a section URI.
+            if (!librarySectionId) {
+                throw new McpError(ErrorCode.InvalidRequest, "librarySectionId is required when smart=true; smart playlists filter a library section");
+            }
+            const resolvedLibtype = libtype ?? this.defaultLibtypeFor(playlistType);
+            const libtypeId = SMART_PLAYLIST_LIBTYPE_IDS[resolvedLibtype];
+            if (libtypeId === undefined) {
+                throw new McpError(ErrorCode.InvalidRequest, `Unknown libtype "${resolvedLibtype}". Valid values: ${Object.keys(SMART_PLAYLIST_LIBTYPE_IDS).join(", ")}`);
+            }
+            const filterSuffix = smartFilter ? `&${smartFilter.replace(/^&/, "")}` : "";
+            uri = `${uriRoot}/library/sections/${librarySectionId}/all?type=${libtypeId}${filterSuffix}`;
+        }
+        else {
+            // Regular playlist — must be seeded with at least one existing library item.
+            // Plex API rejects playlist creation with no uri parameter (issue #48).
+            if (!ratingKeys || ratingKeys.length === 0) {
+                throw new McpError(ErrorCode.InvalidRequest, "ratingKeys is required (at least one item) to create a playlist; Plex does not support creating empty playlists via this endpoint");
+            }
+            // python-plexapi comma-joins all rating keys in a single POST, seeding
+            // the playlist fully without follow-up addToPlaylist calls.
+            uri = `${uriRoot}/library/metadata/${ratingKeys.join(",")}`;
+        }
+        const params = {
+            title,
+            type: playlistType,
+            smart: isSmart ? 1 : 0,
+            uri,
+        };
+        const data = await this.client.makeRequest("/playlists", params, "POST");
+        const container = data;
+        const playlist = container.MediaContainer?.Metadata?.[0];
+        return jsonResponse({
+            created: true,
+            smart: isSmart,
+            playlist: playlist
+                ? {
+                    ratingKey: playlist.ratingKey,
+                    title: playlist.title,
+                    type: playlist.type,
+                    playlistType: playlist.playlistType,
+                    smart: playlist.smart,
+                    leafCount: playlist.leafCount,
+                }
+                : {
+                    title,
+                    type: playlistType,
+                    leafCount: isSmart ? undefined : ratingKeys?.length,
+                },
+        });
+    }
+    async addToPlaylist(playlistId, ratingKey) {
+        this.requireMutativeOpsEnabled("add_to_playlist");
+        validatePlexId(playlistId, "playlistId");
+        validatePlexId(ratingKey, "ratingKey");
+        const machineIdentifier = await this.getMachineIdentifier();
+        const uri = `server://${machineIdentifier}/com.plexapp.plugins.library/library/metadata/${ratingKey}`;
+        const attempts = [
+            { method: "POST", endpoint: `/playlists/${playlistId}/items`, label: "POST /playlists/{id}/items" },
+            { method: "PUT", endpoint: `/playlists/${playlistId}/items`, label: "PUT /playlists/{id}/items" },
+        ];
+        const errors = [];
+        for (const attempt of attempts) {
+            try {
+                await this.client.makeRequest(attempt.endpoint, { uri }, attempt.method);
+                const verification = await this.isItemInPlaylist(playlistId, ratingKey);
+                if (verification.found) {
+                    return jsonResponse({
+                        added: true,
+                        playlistId,
+                        ratingKey,
+                        method: attempt.method,
+                        endpoint: attempt.endpoint,
+                    });
+                }
+                errors.push(`${attempt.label}: request succeeded but item was not found in playlist`);
+            }
+            catch (error) {
+                errors.push(`${attempt.label}: ${this.getErrorMessage(error)}`);
+            }
+        }
+        throw new McpError(ErrorCode.InternalError, `Unable to add item ${ratingKey} to playlist ${playlistId}. Attempts: ${errors.join(" | ")}`);
+    }
+    async removeFromPlaylist(playlistId, playlistItemId) {
+        this.requireMutativeOpsEnabled("remove_from_playlist");
+        validatePlexId(playlistId, "playlistId");
+        validatePlexId(playlistItemId, "playlistItemId");
+        await this.client.makeRequest(`/playlists/${playlistId}/items/${playlistItemId}`, {}, "DELETE");
+        return jsonResponse({
+            removed: true,
+            playlistId,
+            playlistItemId,
+        });
+    }
+    async clearPlaylist(playlistId, confirm = false) {
+        this.requireMutativeOpsEnabled("clear_playlist");
+        validatePlexId(playlistId, "playlistId");
+        const data = await this.client.makeRequest(`/playlists/${playlistId}/items`);
+        const container = data;
+        const items = container.MediaContainer?.Metadata || [];
+        const itemCount = items.length;
+        if (!confirm) {
+            return jsonResponse({
+                preview: true,
+                playlistId,
+                itemCount,
+                confirmationRequired: true,
+                message: "Set confirm=true to clear this playlist",
+            });
+        }
+        await this.client.makeRequest(`/playlists/${playlistId}/items`, {}, "DELETE");
+        return jsonResponse({
+            cleared: true,
+            playlistId,
+            removedCount: itemCount,
+        });
+    }
+    async deletePlaylist(playlistId) {
+        this.requireMutativeOpsEnabled("delete_playlist");
+        validatePlexId(playlistId, "playlistId");
+        await this.client.makeRequest(`/playlists/${playlistId}`, {}, "DELETE");
+        return jsonResponse({
+            deleted: true,
+            playlistId,
+            mediaRetained: true,
+            message: "Deleted the playlist only; underlying Plex media was not removed",
+        });
+    }
+    async addToWatchlist(ratingKey) {
+        this.requireMutativeOpsEnabled("add_to_watchlist");
+        validatePlexId(ratingKey, "ratingKey");
+        const plexGuid = await this.getPlexGuid(ratingKey);
+        await this.client.makeDiscoverRequest("/actions/addToWatchlist", { ratingKey: this.getGlobalRatingKey(plexGuid) }, "PUT");
+        return jsonResponse({ updated: true, action: "add_to_watchlist", ratingKey, plexGuid });
+    }
+    async removeFromWatchlist(input) {
+        this.requireMutativeOpsEnabled("remove_from_watchlist");
+        const normalized = typeof input === "string" ? { ratingKey: input } : input;
+        if (Boolean(normalized.ratingKey) === Boolean(normalized.plexGuid)) {
+            throw new McpError(ErrorCode.InvalidRequest, "Provide exactly one of ratingKey or plexGuid");
+        }
+        const plexGuid = normalized.plexGuid
+            ? this.validatePlexGuid(normalized.plexGuid)
+            : await this.getPlexGuid(validatePlexId(normalized.ratingKey, "ratingKey"));
+        await this.client.makeDiscoverRequest("/actions/removeFromWatchlist", { ratingKey: this.getGlobalRatingKey(plexGuid) }, "PUT");
+        return jsonResponse({
+            updated: true,
+            action: "remove_from_watchlist",
+            ratingKey: normalized.ratingKey,
+            plexGuid,
+        });
+    }
+    async markWatched(ratingKey) {
+        this.requireMutativeOpsEnabled("mark_watched");
+        validatePlexId(ratingKey, "ratingKey");
+        await this.client.markAsWatched(ratingKey);
+        return jsonResponse({ updated: true, watched: true, ratingKey });
+    }
+    async markUnwatched(ratingKey) {
+        this.requireMutativeOpsEnabled("mark_unwatched");
+        validatePlexId(ratingKey, "ratingKey");
+        await this.client.markAsUnwatched(ratingKey);
+        return jsonResponse({ updated: true, watched: false, ratingKey });
+    }
+    async rateMedia(ratingKey, rating) {
+        this.requireMutativeOpsEnabled("rate_media");
+        validatePlexId(ratingKey, "ratingKey");
+        if (!Number.isFinite(rating) || rating < 0 || rating > 10) {
+            throw new McpError(ErrorCode.InvalidRequest, "rating must be between 0 and 10");
+        }
+        await this.client.rateMedia(ratingKey, rating);
+        return jsonResponse({ updated: true, ratingKey, rating });
+    }
+    async getRecentlyWatched(limit = DEFAULT_LIMITS.recentlyWatched, mediaType = "all") {
+        // Resolved before the try so an unknown type isn't swallowed by the fallback below.
+        const rowType = historyRowType(mediaType);
+        // Primary: use watch history endpoint
+        try {
+            const history = await this.fetchWatchHistory(limit, undefined, rowType);
+            return jsonResponse({
+                recentlyWatched: history.watchHistory,
+                totalCount: history.totalSessions,
+                ...(history.scanCapped && { scanCapped: true }),
+                note: "Retrieved from watch history data",
+            });
+        }
+        catch (error) {
+            console.error(`get_recently_watched: watch history failed, using library metadata: ${this.getErrorMessage(error)}`);
+            // Fallback: library metadata approach
+            try {
+                return await this.getRecentlyWatchedFromLibraries(limit, mediaType);
+            }
+            catch (fallbackError) {
+                console.error(`get_recently_watched: library fallback failed: ${this.getErrorMessage(fallbackError)}`);
+                return jsonResponse({
+                    recentlyWatched: [],
+                    totalCount: 0,
+                    error: "Recently watched data not available",
+                    message: "Unable to retrieve recently watched content from this Plex server",
+                });
+            }
+        }
+    }
+    /**
+     * Page through a listing, keeping rows that pass `keep`, until `limit` are kept or the
+     * listing ends. For filters Plex can't apply itself. Stops on a short page, on Plex's
+     * totalSize, on a page identical to the last (Plex ignored the offset), or after
+     * PLEX_FILTERED_SCAN_MAX_PAGES. The last two are reported as scanCapped, since the
+     * listing may hold more matches.
+     */
+    async collectFiltered(endpoint, params, pageSize, keep, limit) {
+        const kept = [];
+        let received = 0;
+        let previousKeys;
+        let finished = false;
+        for (let page = 0; page < PLEX_FILTERED_SCAN_MAX_PAGES; page++) {
+            const data = await this.client.makeRequest(endpoint, {
+                ...params,
+                "X-Plex-Container-Start": received,
+                "X-Plex-Container-Size": pageSize,
+            });
+            const container = data
+                .MediaContainer;
+            const rows = container?.Metadata || [];
+            const keys = JSON.stringify(rows.map((row) => row.historyKey ?? row.ratingKey));
+            if (keys === previousKeys) {
+                break;
+            }
+            previousKeys = keys;
+            kept.push(...rows.filter(keep));
+            received += rows.length;
+            const totalSize = container?.totalSize;
+            if (kept.length >= limit || rows.length < pageSize || (typeof totalSize === "number" && received >= totalSize)) {
+                finished = true;
+                break;
+            }
+        }
+        return { rows: kept.slice(0, limit), scanCapped: !finished };
+    }
+    /**
+     * Session history from Plex's history endpoint, as data. Throws if the
+     * endpoint fails; callers choose their own fallback. Callers that need data
+     * use this and not getWatchHistory, whose text may be TOON instead of JSON.
+     */
+    async fetchWatchHistory(limit, userId, rowType) {
+        const endpoint = "/status/sessions/history/all";
+        const params = { sort: "viewedAt:desc" };
+        if (userId) {
+            params.accountID = userId;
+        }
+        let sessions;
+        let scanCapped = false;
+        if (rowType === undefined) {
+            // Plex ignores X-Plex-Container-Size here unless X-Plex-Container-Start is sent too.
+            const data = await this.client.makeRequest(endpoint, {
+                ...params,
+                "X-Plex-Container-Start": 0,
+                "X-Plex-Container-Size": limit,
+            });
+            const container = data;
+            sessions = container.MediaContainer?.Metadata || [];
+        }
+        else {
+            // The type filter is ours, not Plex's, so page until there are enough matches.
+            const pageLimit = Math.max(1, limit);
+            ({ rows: sessions, scanCapped } = await this.collectFiltered(endpoint, params, Math.max(pageLimit, 100), (session) => session.type === rowType, pageLimit));
+        }
+        return {
+            ...(scanCapped && { scanCapped: true }),
+            watchHistory: sessions.map((session) => ({
+                sessionKey: session.sessionKey,
+                ratingKey: session.ratingKey,
+                title: session.title,
+                type: session.type,
+                ...showContext(session),
+                year: session.year,
+                viewedAt: session.viewedAt,
+                duration: session.duration,
+                viewOffset: session.viewOffset,
+                user: session.User?.title,
+                player: session.Player?.title,
+                platform: session.Player?.platform,
+                progress: session.viewOffset && session.duration
+                    ? Math.round((session.viewOffset / session.duration) * 100)
+                    : 0,
+                completed: isContentCompleted(session.duration, session.viewOffset, 1 // viewCount always > 0 for watched items
+                ),
+            })),
+            totalSessions: sessions.length,
+        };
+    }
+    async getWatchHistory(limit = DEFAULT_LIMITS.watchHistory, userId, mediaType = "all") {
+        // Resolved before the try so an unknown type isn't swallowed by the fallback below.
+        const rowType = historyRowType(mediaType);
+        try {
+            // Primary: session history endpoint
+            return jsonResponse(await this.fetchWatchHistory(limit, userId, rowType));
+        }
+        catch (error) {
+            console.error(`get_watch_history: watch history failed, using library metadata: ${this.getErrorMessage(error)}`);
+            // Fallback: build pseudo-history from library metadata
+            try {
+                return await this.getWatchHistoryFromLibraries(limit, userId, mediaType);
+            }
+            catch (fallbackError) {
+                console.error(`get_watch_history: library fallback failed: ${this.getErrorMessage(fallbackError)}`);
+                return jsonResponse({
+                    error: "Watch history not available",
+                    message: "Unable to retrieve watch history from this Plex server",
+                    suggestion: "This feature may require Plex Pass or detailed logging to be enabled",
+                    watchHistory: [],
+                });
+            }
+        }
+    }
+    // ── Extended / analytics tools ──────────────────────────────
+    async getFullyWatched(libraryKey, mediaType = "all", limit = DEFAULT_LIMITS.fullyWatched) {
+        // Resolved before the try so an unknown type isn't swallowed by the fallback below.
+        const typeId = mediaType !== "all" ? this.client.getPlexTypeId(mediaType) : undefined;
+        try {
+            let endpoint = "/library/all";
+            // Plex omits viewOffset from finished items, so completion can't be judged from the
+            // returned items. Ask Plex instead, with the query behind its own "Recently Watched"
+            // hub: watched at least once (unwatched=0) and not in progress (viewOffset=0).
+            const params = {
+                sort: "lastViewedAt:desc",
+                unwatched: 0,
+                viewOffset: 0,
+            };
+            if (libraryKey) {
+                validatePlexId(libraryKey, "libraryKey");
+                endpoint = `/library/sections/${libraryKey}/all`;
+            }
+            if (typeId !== undefined) {
+                params.type = typeId;
+            }
+            // isFullyWatched can still drop partly watched shows, so page in twice the limit
+            // until enough survive.
+            const pageLimit = Math.max(1, limit);
+            const { rows: items, scanCapped } = await this.collectFiltered(endpoint, params, pageLimit * 2, isFullyWatched, pageLimit);
+            return jsonResponse({
+                ...(scanCapped && { scanCapped: true }),
+                fullyWatched: items.map((item) => ({
+                    ratingKey: item.ratingKey,
+                    title: item.title,
+                    type: item.type,
+                    ...showContext(item),
+                    year: item.year,
+                    viewCount: item.viewCount,
+                    lastViewedAt: item.lastViewedAt,
+                    duration: item.duration,
+                    viewOffset: item.viewOffset,
+                    completionPercent: item.duration && item.viewOffset
+                        ? Math.round((item.viewOffset / item.duration) * 100)
+                        : 100,
+                    rating: item.rating,
+                    summary: truncate(item.summary || "", SUMMARY_PREVIEW_LENGTH),
+                })),
+                totalCount: items.length,
+                libraryKey: libraryKey || "all",
+                mediaType,
+            });
+        }
+        catch {
+            // Fallback: iterate libraries
+            try {
+                return await this.getFullyWatchedFromLibraries(libraryKey, mediaType, limit);
+            }
+            catch {
+                return jsonResponse({
+                    error: "Fully watched data not available",
+                    message: "Unable to retrieve watched content from this Plex server",
+                    suggestion: "Check server permissions and ensure libraries are accessible",
+                    fullyWatched: [],
+                });
+            }
+        }
+    }
+    async getWatchStats(timeRange = 30, statType = "plays") {
+        const fromDate = Math.floor((Date.now() - timeRange * 24 * 60 * 60 * 1000) / 1000);
+        try {
+            // Plex filters by time and the pages are walked until the range is exhausted. An
+            // unsorted history comes back oldest first, so a fixed cap would drop the range.
+            const sessions = await this.client.fetchAllPages("/status/sessions/history/all", { "viewedAt>": fromDate });
+            const filteredSessions = sessions.filter((session) => session.viewedAt && session.viewedAt >= fromDate);
+            let stats;
+            switch (statType) {
+                case "plays":
+                    stats = this.calculatePlayStats(filteredSessions);
+                    break;
+                case "duration":
+                    stats = this.calculateDurationStats(filteredSessions);
+                    break;
+                case "users":
+                    stats = this.calculateUserStats(filteredSessions);
+                    break;
+                case "libraries":
+                    stats = this.calculateLibraryStats(filteredSessions);
+                    break;
+                case "platforms":
+                    stats = this.calculatePlatformStats(filteredSessions);
+                    break;
+                default:
+                    stats = this.calculatePlayStats(filteredSessions);
+            }
+            return jsonResponse({
+                timeRange: `${timeRange} days`,
+                statType,
+                totalSessions: filteredSessions.length,
+                stats,
+            });
+        }
+        catch {
+            return await this.getBasicStats(timeRange, statType);
+        }
+    }
+    async getUserStats(timeRange = 30) {
+        try {
+            const data = await this.client.makeRequest("/accounts");
+            const container = data;
+            const users = container.MediaContainer?.Account || [];
+            return jsonResponse({
+                users: users.map((user) => ({
+                    id: user.id,
+                    name: user.name,
+                    email: user.email,
+                })),
+                totalUsers: users.length,
+            });
+        }
+        catch {
+            return jsonResponse({
+                message: "User statistics not available",
+                error: "Unable to access user data",
+            });
+        }
+    }
+    async getLibraryStats(libraryKey) {
+        if (libraryKey) {
+            validatePlexId(libraryKey, "libraryKey");
+            const data = await this.client.makeRequest(`/library/sections/${libraryKey}`);
+            const container = data;
+            const library = container.MediaContainer?.Directory?.[0];
+            if (!library) {
+                throw new McpError(ErrorCode.InvalidRequest, `Library not found: ${libraryKey}`);
+            }
+            return jsonResponse({
+                library: {
+                    key: library.key,
+                    title: library.title,
+                    type: library.type,
+                    count: library.count,
+                    scannedAt: library.scannedAt,
+                    updatedAt: library.updatedAt,
+                    language: library.language,
+                    locations: library.Location?.map((loc) => loc.path) || [],
+                },
+            });
+        }
+        else {
+            const data = await this.client.makeRequest("/library/sections");
+            const container = data;
+            const libraries = container.MediaContainer?.Directory || [];
+            return jsonResponse({
+                libraries: libraries.map((lib) => ({
+                    key: lib.key,
+                    title: lib.title,
+                    type: lib.type,
+                    count: lib.count,
+                    scannedAt: lib.scannedAt,
+                })),
+                totalLibraries: libraries.length,
+            });
+        }
+    }
+    async getPopularContent(timeRange = 30, metric = "plays", mediaType = "all", limit = DEFAULT_LIMITS.popularContent) {
+        try {
+            const librariesData = await this.client.makeRequest("/library/sections");
+            const libContainer = librariesData;
+            const libraries = libContainer.MediaContainer?.Directory || [];
+            let allContent = [];
+            const typeId = mediaType !== "all" ? this.client.getPlexTypeId(mediaType) : undefined;
+            for (const library of libraries) {
+                try {
+                    const params = {
+                        ...firstPage(PLEX_CONTAINER_SIZE),
+                        sort: metric === "plays" ? "viewCount:desc" : "lastViewedAt:desc",
+                    };
+                    if (typeId !== undefined) {
+                        params.type = typeId;
+                    }
+                    const contentData = await this.client.makeRequest(`/library/sections/${library.key}/all`, params);
+                    const container = contentData;
+                    allContent.push(...(container.MediaContainer?.Metadata || []));
+                }
+                catch {
+                    continue;
+                }
+            }
+            let filteredContent = allContent.filter((item) => item.viewCount > 0);
+            if (metric === "plays") {
+                filteredContent.sort((a, b) => (b.viewCount || 0) - (a.viewCount || 0));
+            }
+            else {
+                filteredContent.sort((a, b) => (b.lastViewedAt || 0) - (a.lastViewedAt || 0));
+            }
+            filteredContent = filteredContent.slice(0, limit);
+            return jsonResponse({
+                metric,
+                mediaType,
+                timeRange: `${timeRange} days`,
+                popularContent: filteredContent.map((item) => ({
+                    ratingKey: item.ratingKey,
+                    title: item.title,
+                    type: item.type,
+                    ...showContext(item),
+                    year: item.year,
+                    viewCount: item.viewCount,
+                    lastViewedAt: item.lastViewedAt,
+                    rating: item.rating,
+                    duration: item.duration,
+                })),
+            });
+        }
+        catch (error) {
+            throw new McpError(ErrorCode.InternalError, `Error getting popular content: ${error}`);
+        }
+    }
+    // ── Private helpers ─────────────────────────────────────────
+    async writeToStream(stream, chunk) {
+        if (stream.write(chunk)) {
+            return;
+        }
+        await new Promise((resolve, reject) => {
+            const onDrain = () => {
+                stream.off("error", onError);
+                resolve();
+            };
+            const onError = (error) => {
+                stream.off("drain", onDrain);
+                reject(error);
+            };
+            stream.once("drain", onDrain);
+            stream.once("error", onError);
+        });
+    }
+    async finishStream(stream) {
+        await new Promise((resolve, reject) => {
+            stream.once("finish", () => resolve());
+            stream.once("error", (error) => reject(error));
+            stream.end();
+        });
+    }
+    requireMutativeOpsEnabled(toolName) {
+        if (isMutativeOpsEnabled()) {
+            return;
+        }
+        throw new McpError(ErrorCode.InvalidRequest, `${toolName} is disabled. Set ${PLEX_MUTATIVE_OPS_ENV_VAR}=true to enable mutative Plex tools.`);
+    }
+    getErrorMessage(error) {
+        return error instanceof Error ? error.message : String(error);
+    }
+    parseResponseText(response) {
+        const text = response.content?.[0]?.text;
+        if (!text)
+            return undefined;
+        try {
+            return JSON.parse(text);
+        }
+        catch {
+            return undefined;
+        }
+    }
+    normalizeTagList(input) {
+        if (!input || !Array.isArray(input))
+            return [];
+        return input
+            .map((item) => {
+            if (typeof item === "string")
+                return item;
+            if (item && typeof item === "object" && typeof item.tag === "string") {
+                return item.tag;
+            }
+            return "";
+        })
+            .map((tag) => tag.trim())
+            .filter((tag) => tag.length > 0);
+    }
+    async replaceTagsSafely(ratingKey, tag, desiredTags) {
+        const { item, libraryKey } = await this.getMediaContext(ratingKey);
+        const currentTags = this.getCurrentTags(item, tag);
+        const desiredSet = new Set(desiredTags);
+        const currentSet = new Set(currentTags);
+        const toAdd = desiredTags.filter((value) => !currentSet.has(value));
+        const toRemove = currentTags.filter((value) => !desiredSet.has(value));
+        const warnings = [];
+        let success = false;
+        // Lock the field only if tags remain. Decided once from the final set so the removal
+        // in a replace doesn't drop the lock the add just set, and an emptied field isn't pinned.
+        const locked = desiredTags.length > 0;
+        // Add first, remove second to avoid data loss on partial failures.
+        let addFailed = false;
+        if (toAdd.length > 0) {
+            try {
+                await this.editTagsForItem(ratingKey, libraryKey, item.type, tag, toAdd, false, locked);
+                success = true;
+            }
+            catch (error) {
+                addFailed = true;
+                warnings.push(`Failed adding ${tag} tags: ${this.getErrorMessage(error)}`);
+            }
+        }
+        // If the add failed, removing now could leave the field empty (and locked), losing the old tags.
+        let removed = toRemove;
+        if (toRemove.length > 0 && addFailed) {
+            removed = [];
+            warnings.push(`Skipped removing ${tag} tags because adding the new ones failed`);
+        }
+        else if (toRemove.length > 0) {
+            try {
+                await this.editTagsForItem(ratingKey, libraryKey, item.type, tag, toRemove, true, locked);
+                success = true;
+            }
+            catch (error) {
+                warnings.push(`Failed removing ${tag} tags: ${this.getErrorMessage(error)}`);
+            }
+        }
+        // An empty field can still be locked (e.g. by an edit made before #205 was fixed). With nothing
+        // to add or remove, clear the lock on its own so a refresh can fill the field again. This only
+        // fires when Plex reports the lock under the same name the tool edits.
+        let unlocked = false;
+        if (desiredTags.length === 0 && toAdd.length === 0 && toRemove.length === 0 && this.isFieldLocked(item, tag)) {
+            try {
+                await this.editTagsForItem(ratingKey, libraryKey, item.type, tag, [], false, false);
+                success = true;
+                unlocked = true;
+            }
+            catch (error) {
+                warnings.push(`Failed unlocking ${tag}: ${this.getErrorMessage(error)}`);
+            }
+        }
+        return {
+            tag,
+            success,
+            added: toAdd,
+            removed,
+            unlocked: unlocked || undefined,
+            warnings: warnings.length > 0 ? warnings : undefined,
+        };
+    }
+    isFieldLocked(item, field) {
+        const fields = Array.isArray(item.Field) ? item.Field : [];
+        // Same test as getEditableFields' lockedFields, so the two never disagree about a field.
+        return fields.some((entry) => entry.name === field && Boolean(entry.locked));
+    }
+    getCurrentTags(item, tag) {
+        const list = (() => {
+            switch (tag) {
+                case "genre":
+                    return item.Genre;
+                case "collection":
+                    return item.Collection;
+                case "director":
+                    return item.Director;
+                case "label":
+                    return item.Label;
+                case "role":
+                    return item.Role;
+            }
+        })();
+        return (Array.isArray(list) ? list : []).map((entry) => entry.tag).filter(Boolean);
+    }
+    async editTagsForItem(ratingKey, libraryKey, itemType, tag, items, remove, locked) {
+        validatePlexId(libraryKey, "libraryKey");
+        const params = {
+            id: ratingKey,
+            type: this.getTaggableTypeId(itemType),
+            ...this.buildTagParams(tag, items, locked, remove),
+        };
+        await this.client.makeRequest(`/library/sections/${libraryKey}/all`, params, "PUT");
+    }
+    getTaggableTypeId(itemType) {
+        if (!Object.hasOwn(PLEX_TAGGABLE_TYPE_IDS, itemType)) {
+            throw new Error(`Unknown media type "${itemType}". Expected one of: ${Object.keys(PLEX_TAGGABLE_TYPE_IDS).join(", ")}`);
+        }
+        return PLEX_TAGGABLE_TYPE_IDS[itemType];
+    }
+    buildTagParams(tag, items, locked, remove) {
+        const data = {
+            [`${tag}.locked`]: locked ? 1 : 0,
+        };
+        if (remove) {
+            data[`${tag}[].tag.tag-`] = items.join(",");
+            return data;
+        }
+        items.forEach((item, index) => {
+            data[`${tag}[${index}].tag.tag`] = item;
+        });
+        return data;
+    }
+    async getMediaContext(ratingKey) {
+        validatePlexId(ratingKey, "ratingKey");
+        const data = await this.client.makeRequest(`/library/metadata/${ratingKey}`);
+        const container = data;
+        const item = container.MediaContainer?.Metadata?.[0];
+        if (!item) {
+            throw new McpError(ErrorCode.InvalidRequest, `Media item not found: ${ratingKey}`);
+        }
+        const libraryKey = item.librarySectionID ||
+            item.librarySectionKey ||
+            item.librarySection?.key;
+        if (!libraryKey) {
+            throw new McpError(ErrorCode.InternalError, "Unable to determine library section key for the media item");
+        }
+        return { item, libraryKey: String(libraryKey) };
+    }
+    async getPlexGuid(ratingKey) {
+        const data = await this.client.makeRequest(`/library/metadata/${ratingKey}`);
+        const container = data;
+        return this.validatePlexGuid(container.MediaContainer?.Metadata?.[0]?.guid);
+    }
+    validatePlexGuid(value) {
+        if (typeof value !== "string" || !/^plex:\/\/(movie|show)\/[^/?#]+$/.test(value)) {
+            throw new McpError(ErrorCode.InvalidRequest, "Watchlist items must be matched with the Plex Movie or Plex TV Series agent");
+        }
+        return value;
+    }
+    getGlobalRatingKey(plexGuid) {
+        return plexGuid.slice(plexGuid.lastIndexOf("/") + 1);
+    }
+    async setPosterFromUrl(ratingKey, url) {
+        validatePlexId(ratingKey, "ratingKey");
+        if (!url) {
+            return { success: false, error: "Poster update skipped: poster url is required" };
+        }
+        const attempts = [
+            { endpoint: `/library/metadata/${ratingKey}/posters`, method: "POST", label: "POST /posters" },
+            { endpoint: `/library/metadata/${ratingKey}/posters`, method: "PUT", label: "PUT /posters" },
+        ];
+        const errors = [];
+        for (const attempt of attempts) {
+            try {
+                await this.client.makeRequest(attempt.endpoint, { url }, attempt.method);
+                return { success: true };
+            }
+            catch (error) {
+                errors.push(`${attempt.label}: ${this.getErrorMessage(error)}`);
+            }
+        }
+        return { success: false, error: `Poster update failed. Attempts: ${errors.join(" | ")}` };
+    }
+    async getMachineIdentifier() {
+        if (this.machineIdentifier) {
+            return this.machineIdentifier;
+        }
+        const data = await this.client.makeRequest("/identity");
+        const machineIdentifier = data
+            .MediaContainer?.machineIdentifier;
+        if (!machineIdentifier) {
+            throw new McpError(ErrorCode.InternalError, "Unable to determine Plex machine identifier. Check server access and token.");
+        }
+        this.machineIdentifier = machineIdentifier;
+        return machineIdentifier;
+    }
+    async isItemInPlaylist(playlistId, ratingKey) {
+        validatePlexId(playlistId, "playlistId");
+        try {
+            const data = await this.client.makeRequest(`/playlists/${playlistId}/items`, {
+                "X-Plex-Container-Start": 0,
+                "X-Plex-Container-Size": 2000,
+            });
+            const container = data;
+            const items = container.MediaContainer?.Metadata || [];
+            return {
+                found: items.some((item) => String(item.ratingKey) === String(ratingKey)),
+            };
+        }
+        catch {
+            return { found: false };
+        }
+    }
+    getPlaylistType(type) {
+        if (type === "video" || type === "audio" || type === "photo") {
+            return type;
+        }
+        const map = {
+            movie: "video",
+            show: "video",
+            episode: "video",
+            artist: "audio",
+            album: "audio",
+            track: "audio",
+        };
+        return map[type] || "video";
+    }
+    /**
+     * Default libtype for a smart playlist when the caller didn't specify one.
+     * Maps the outer playlist type to a sensible leaf content type.
+     */
+    defaultLibtypeFor(playlistType) {
+        if (playlistType === "audio")
+            return "track";
+        if (playlistType === "photo")
+            return "photo";
+        return "movie";
+    }
+    async getRecentlyWatchedFromLibraries(limit, mediaType) {
+        const librariesData = await this.client.makeRequest("/library/sections");
+        const libContainer = librariesData;
+        const libraries = libContainer.MediaContainer?.Directory || [];
+        let allRecentItems = [];
+        // Resolved outside the loop, whose catch would otherwise skip every library for a bad type.
+        const typeId = mediaType !== "all" ? this.client.getPlexTypeId(mediaType) : undefined;
+        for (const library of libraries) {
+            try {
+                const params = {
+                    sort: "lastViewedAt:desc",
+                    ...firstPage(Math.ceil(limit / libraries.length) + 5),
+                };
+                if (typeId !== undefined) {
+                    params.type = typeId;
+                }
+                const contentData = await this.client.makeRequest(`/library/sections/${library.key}/all`, params);
+                const container = contentData;
+                const content = container.MediaContainer?.Metadata || [];
+                const viewedContent = content.filter((item) => item.lastViewedAt && item.viewCount > 0);
+                allRecentItems.push(...viewedContent);
+            }
+            catch {
+                continue;
+            }
+        }
+        allRecentItems.sort((a, b) => (b.lastViewedAt || 0) - (a.lastViewedAt || 0));
+        allRecentItems = allRecentItems.slice(0, limit);
+        return jsonResponse({
+            recentlyWatched: allRecentItems.map((item) => ({
+                ratingKey: item.ratingKey,
+                title: item.title,
+                type: item.type,
+                ...showContext(item),
+                year: item.year,
+                lastViewedAt: item.lastViewedAt,
+                viewCount: item.viewCount,
+                duration: item.duration,
+                viewOffset: item.viewOffset || 0,
+                progress: progressPercent(item),
+            })),
+            totalCount: allRecentItems.length,
+            note: "Retrieved from library metadata",
+        });
+    }
+    async getWatchHistoryFromLibraries(limit, userId, mediaType = "all") {
+        const librariesData = await this.client.makeRequest("/library/sections");
+        const libContainer = librariesData;
+        const libraries = libContainer.MediaContainer?.Directory || [];
+        let allViewedItems = [];
+        // Resolved outside the loop, whose catch would otherwise skip every library for a bad type.
+        const typeId = mediaType !== "all" ? this.client.getPlexTypeId(mediaType) : undefined;
+        for (const library of libraries) {
+            try {
+                const params = {
+                    ...firstPage(Math.ceil(limit / libraries.length) + 5),
+                    sort: "lastViewedAt:desc",
+                };
+                if (typeId !== undefined) {
+                    params.type = typeId;
+                }
+                const contentData = await this.client.makeRequest(`/library/sections/${library.key}/all`, params);
+                const container = contentData;
+                const content = container.MediaContainer?.Metadata || [];
+                const viewedContent = content.filter((item) => item.lastViewedAt && item.viewCount > 0);
+                const historyItems = viewedContent.map((item) => ({
+                    ratingKey: item.ratingKey,
+                    title: item.title,
+                    type: item.type,
+                    ...showContext(item),
+                    year: item.year,
+                    lastViewedAt: item.lastViewedAt,
+                    viewCount: item.viewCount,
+                    duration: item.duration,
+                    viewOffset: item.viewOffset || 0,
+                    library: library.title,
+                    // Judged here, from the raw item: shows and seasons need their leaf counts.
+                    completed: isFullyWatched(item) &&
+                        isContentCompleted(item.duration, item.viewOffset, item.viewCount),
+                    progress: progressPercent(item),
+                }));
+                allViewedItems.push(...historyItems);
+            }
+            catch {
+                continue;
+            }
+        }
+        allViewedItems.sort((a, b) => (b.lastViewedAt || 0) - (a.lastViewedAt || 0));
+        allViewedItems = allViewedItems.slice(0, limit);
+        return jsonResponse({
+            // Already shaped (incl. showContext, completed and progress) by the historyItems map above.
+            watchHistory: allViewedItems,
+            totalSessions: allViewedItems.length,
+            note: "Generated from library metadata (fallback method)",
+        });
+    }
+    async getFullyWatchedFromLibraries(libraryKey, mediaType, limit) {
+        const librariesData = await this.client.makeRequest("/library/sections");
+        const libContainer = librariesData;
+        const libraries = libContainer.MediaContainer?.Directory || [];
+        let allWatchedItems = [];
+        // Resolved outside the loop, whose catch would otherwise skip every library for a bad type.
+        const typeId = mediaType !== "all" ? this.client.getPlexTypeId(mediaType) : undefined;
+        for (const library of libraries) {
+            try {
+                if (libraryKey && library.key !== libraryKey)
+                    continue;
+                const params = {
+                    ...firstPage(Math.ceil(limit / libraries.length) + 10),
+                    // Newest viewed first: sorted by addedAt, a cap would keep mostly unwatched items.
+                    sort: "lastViewedAt:desc",
+                };
+                if (typeId !== undefined) {
+                    params.type = typeId;
+                }
+                const contentData = await this.client.makeRequest(`/library/sections/${library.key}/all`, params);
+                const container = contentData;
+                const content = container.MediaContainer?.Metadata || [];
+                const watchedContent = content.filter((item) => item.viewCount > 0);
+                allWatchedItems.push(...watchedContent);
+            }
+            catch {
+                continue;
+            }
+        }
+        allWatchedItems.sort((a, b) => (b.viewCount || 0) - (a.viewCount || 0));
+        allWatchedItems = allWatchedItems.slice(0, limit);
+        return jsonResponse({
+            fullyWatched: allWatchedItems.map((item) => ({
+                ratingKey: item.ratingKey,
+                title: item.title,
+                type: item.type,
+                ...showContext(item),
+                year: item.year,
+                viewCount: item.viewCount,
+                lastViewedAt: item.lastViewedAt,
+                duration: item.duration,
+                rating: item.rating,
+                summary: truncate(item.summary || "", SUMMARY_PREVIEW_LENGTH),
+            })),
+            totalCount: allWatchedItems.length,
+            note: "Retrieved using fallback method - showing items with any view count",
+        });
+    }
+    async getBasicStats(timeRange, statType) {
+        const librariesData = await this.client.makeRequest("/library/sections");
+        const libContainer = librariesData;
+        const libraries = libContainer.MediaContainer?.Directory || [];
+        return jsonResponse({
+            message: "Detailed statistics not available, showing library overview",
+            libraries: libraries.map((lib) => ({
+                title: lib.title,
+                type: lib.type,
+                count: lib.count,
+                scannedAt: lib.scannedAt,
+            })),
+        });
+    }
+    calculatePlayStats(sessions) {
+        const playsByDay = {};
+        const playsByType = {};
+        sessions.forEach((session) => {
+            const date = new Date(session.viewedAt * 1000).toISOString().split("T")[0];
+            playsByDay[date] = (playsByDay[date] || 0) + 1;
+            playsByType[session.type] = (playsByType[session.type] || 0) + 1;
+        });
+        return {
+            totalPlays: sessions.length,
+            playsByDay,
+            playsByType,
+            averagePlaysPerDay: sessions.length / Object.keys(playsByDay).length || 0,
+        };
+    }
+    calculateDurationStats(sessions) {
+        let totalDuration = 0;
+        const durationByType = {};
+        sessions.forEach((session) => {
+            const duration = session.duration || 0;
+            totalDuration += duration;
+            durationByType[session.type] = (durationByType[session.type] || 0) + duration;
+        });
+        return {
+            totalDuration,
+            totalDurationHours: Math.round(totalDuration / 3600000),
+            durationByType,
+            averageSessionDuration: sessions.length > 0 ? totalDuration / sessions.length : 0,
+        };
+    }
+    calculateUserStats(sessions) {
+        const userCounts = {};
+        const userDuration = {};
+        sessions.forEach((session) => {
+            const user = session.User?.title || "Unknown";
+            userCounts[user] = (userCounts[user] || 0) + 1;
+            userDuration[user] = (userDuration[user] || 0) + (session.duration || 0);
+        });
+        return {
+            uniqueUsers: Object.keys(userCounts).length,
+            userPlayCounts: userCounts,
+            userWatchTime: userDuration,
+            topUsers: Object.entries(userCounts)
+                .sort(([, a], [, b]) => b - a)
+                .slice(0, 10),
+        };
+    }
+    calculateLibraryStats(sessions) {
+        const libraryCounts = {};
+        sessions.forEach((session) => {
+            const library = session.librarySectionTitle || "Unknown";
+            libraryCounts[library] = (libraryCounts[library] || 0) + 1;
+        });
+        return {
+            libraryPlayCounts: libraryCounts,
+            topLibraries: Object.entries(libraryCounts)
+                .sort(([, a], [, b]) => b - a)
+                .slice(0, 10),
+        };
+    }
+    calculatePlatformStats(sessions) {
+        const platformCounts = {};
+        sessions.forEach((session) => {
+            const platform = session.Player?.platform || "Unknown";
+            platformCounts[platform] = (platformCounts[platform] || 0) + 1;
+        });
+        return {
+            platformPlayCounts: platformCounts,
+            topPlatforms: Object.entries(platformCounts)
+                .sort(([, a], [, b]) => b - a)
+                .slice(0, 10),
+        };
+    }
+    // ──── Recommendations ────
+    async getRecommendations(libraryKey, limit = DEFAULT_LIMITS.recommendations, userId, qualityBias = 1.0, traktWatchedTitles) {
+        const allMovies = await this.client.getLibraryMoviesWithMeta(libraryKey, userId);
+        // Merge Plex and Trakt watched data — Trakt catches off-Plex watches
+        const isWatched = (m) => {
+            if (m.viewCount > 0)
+                return true;
+            if (traktWatchedTitles && m.year) {
+                return traktWatchedTitles.has(`${m.title.toLowerCase()}|${m.year}`);
+            }
+            return false;
+        };
+        const watched = allMovies.filter(isWatched);
+        const unwatched = allMovies.filter((m) => !isWatched(m));
+        const traktOnlyCount = traktWatchedTitles
+            ? watched.filter((m) => m.viewCount === 0).length
+            : 0;
+        if (watched.length < MIN_WATCHED_FOR_RECOMMENDATIONS) {
+            return jsonResponse({
+                success: false,
+                watchedCount: watched.length,
+                message: `Not enough watch history to generate recommendations (watched: ${watched.length}). Watch at least ${MIN_WATCHED_FOR_RECOMMENDATIONS} movies first.`,
+            });
+        }
+        if (unwatched.length === 0) {
+            return jsonResponse({
+                success: false,
+                watchedCount: watched.length,
+                message: "You've watched every movie in this library!",
+            });
+        }
+        const profile = this.buildTasteProfile(watched);
+        const scored = unwatched
+            .map((movie) => this.scoreMovie(movie, profile, qualityBias))
+            .sort((a, b) => b.score - a.score);
+        const diverse = this.applyDiversityPenalty(scored, limit);
+        const topGenres = [...profile.genreScores.entries()]
+            .sort(([, a], [, b]) => b - a)
+            .slice(0, 5)
+            .map(([g]) => g);
+        const topDirectors = [...profile.directorCounts.entries()]
+            .sort(([, a], [, b]) => b - a)
+            .slice(0, 3)
+            .map(([d]) => d);
+        const topActors = [...profile.actorCounts.entries()]
+            .sort(([, a], [, b]) => b - a)
+            .slice(0, 3)
+            .map(([a]) => a);
+        return jsonResponse({
+            success: true,
+            libraryKey,
+            watchedCount: watched.length,
+            unwatchedCount: unwatched.length,
+            traktExtraWatched: traktOnlyCount > 0 ? traktOnlyCount : undefined,
+            userId: userId || "server_owner",
+            tasteProfile: {
+                topGenres,
+                topDirectors,
+                topActors,
+                avgRating: Math.round(profile.weightedAvgRating * 10) / 10,
+            },
+            traktEnhanced: qualityBias !== 1.0 || traktOnlyCount > 0,
+            recommendations: diverse.slice(0, limit).map((m) => ({
+                ratingKey: m.ratingKey,
+                title: m.title,
+                year: m.year,
+                genres: m.genres,
+                rating: m.rating,
+                score: parseFloat(m.score.toFixed(3)),
+                reasons: m.reasons,
+            })),
+        });
+    }
+    buildTasteProfile(watched) {
+        const genreScores = new Map();
+        const directorCounts = new Map();
+        const actorCounts = new Map();
+        const now = Date.now() / 1000;
+        let ratingSum = 0;
+        let ratingWeight = 0;
+        const years = [];
+        for (const movie of watched) {
+            const daysSince = movie.lastViewedAt ? (now - movie.lastViewedAt) / 86400 : 365;
+            const recencyWeight = Math.exp(-Math.LN2 * daysSince / RECENCY_HALF_LIFE_DAYS);
+            const viewWeight = Math.log1p(movie.viewCount);
+            const itemWeight = recencyWeight * viewWeight;
+            for (const genre of movie.genres) {
+                genreScores.set(genre, (genreScores.get(genre) || 0) + itemWeight);
+            }
+            for (const director of movie.directors) {
+                directorCounts.set(director, (directorCounts.get(director) || 0) + 1);
+            }
+            for (const actor of movie.actors) {
+                actorCounts.set(actor, (actorCounts.get(actor) || 0) + 1);
+            }
+            if (movie.rating !== undefined) {
+                ratingSum += movie.rating * itemWeight;
+                ratingWeight += itemWeight;
+            }
+            if (movie.year)
+                years.push(movie.year);
+        }
+        // Normalize genre scores to 0–1
+        const maxGenre = Math.max(...genreScores.values(), 1);
+        for (const [g, v] of genreScores)
+            genreScores.set(g, v / maxGenre);
+        const weightedAvgRating = ratingWeight > 0 ? ratingSum / ratingWeight : 5;
+        const yearMean = years.length > 0 ? years.reduce((a, b) => a + b, 0) / years.length : 2000;
+        const yearStdDev = years.length > 1
+            ? Math.sqrt(years.reduce((sum, y) => sum + (y - yearMean) ** 2, 0) / years.length)
+            : 20;
+        return { genreScores, directorCounts, actorCounts, weightedAvgRating, yearMean, yearStdDev };
+    }
+    scoreMovie(movie, profile, qualityBias) {
+        const reasons = [];
+        // Genre match: average across genres to prevent single-genre dominance
+        let genreScore = 0;
+        for (const genre of movie.genres) {
+            const gs = profile.genreScores.get(genre) || 0;
+            if (gs > 0.3)
+                reasons.push(`You love ${genre}`);
+            genreScore += gs;
+        }
+        // Normalize: divide by genre count to avoid multi-genre penalty
+        genreScore = movie.genres.length > 0 ? (genreScore / movie.genres.length) * 0.8 + 0.2 : 0.2;
+        // Rating bonus: normalize to 0–1 range (accounting for qualityBias)
+        const ratingScore = movie.rating !== undefined ? Math.min((movie.rating / 10) * qualityBias, 1.0) : 0.5;
+        if (movie.rating !== undefined && movie.rating >= 7) {
+            reasons.push(`Highly rated (${movie.rating}/10)`);
+        }
+        // Director match: cap at 1.0 for single strong match
+        let directorScore = 0;
+        for (const director of movie.directors) {
+            const count = profile.directorCounts.get(director) || 0;
+            if (count > 0) {
+                directorScore = Math.min(count / 3, 1.0);
+                reasons.push(`Director: ${director} (watched ${count} films)`);
+                break;
+            }
+        }
+        // Actor match: normalized to 0–1
+        let actorScore = 0;
+        const topActors = [...profile.actorCounts.entries()]
+            .sort(([, a], [, b]) => b - a)
+            .slice(0, TASTE_TOP_ACTORS);
+        for (const actor of movie.actors) {
+            const entry = topActors.find(([a]) => a === actor);
+            if (entry) {
+                actorScore = Math.min(entry[1] / 5, 1.0);
+                reasons.push(`Cast: ${actor} (in ${entry[1]} of your watched films)`);
+                break;
+            }
+        }
+        // Era match: normalized to 0–1
+        let eraScore = 0.5;
+        if (movie.year && profile.yearStdDev > 0) {
+            eraScore = Math.exp(-((movie.year - profile.yearMean) ** 2) / (2 * profile.yearStdDev ** 2));
+        }
+        // Weighted sum: all components now normalized to 0–1 range
+        const score = genreScore * 0.40 +
+            ratingScore * 0.30 +
+            directorScore * 0.15 +
+            actorScore * 0.10 +
+            eraScore * 0.05;
+        return { ...movie, score, reasons: [...new Set(reasons)].slice(0, 4) };
+    }
+    applyDiversityPenalty(scored, limit) {
+        const candidates = scored.slice(0, limit * 3);
+        const genreCounts = new Map();
+        const result = [];
+        for (const movie of candidates) {
+            const topGenre = movie.genres[0] || "Unknown";
+            const count = genreCounts.get(topGenre) || 0;
+            const penalty = count >= 2 ? 0.15 * (count - 1) : 0;
+            const adjustedScore = movie.score - penalty;
+            genreCounts.set(topGenre, count + 1);
+            result.push({ ...movie, score: adjustedScore });
+        }
+        return result.sort((a, b) => b.score - a.score);
+    }
+}
