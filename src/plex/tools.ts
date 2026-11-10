@@ -155,6 +155,9 @@ function watchState(item: Record<string, unknown>) {
   return { watchStatus, viewCount, lastViewedAt: item.lastViewedAt, ...(inProgress ? { progressPercent: progressPercent(item) } : {}) };
 }
 
+/** Elements a library listing leaves out: cast, crew, files and artwork it never shows. Genres and labels stay. */
+const LISTING_EXCLUDED_ELEMENTS = "Media,Role,Director,Writer,Country,Producer,Similar,Image,UltraBlurColors";
+
 /** Helper: the tag names of one of an item's tag lists (Label, Genre, ...). */
 function tagNames(value: unknown): string[] | undefined {
   return Array.isArray(value) ? value.map((tag) => (tag as { tag?: string }).tag).filter((tag): tag is string => !!tag) : undefined;
@@ -220,6 +223,9 @@ export class PlexTools {
     const params: Record<string, string | number> = {
       "X-Plex-Container-Start": safeOffset,
       "X-Plex-Container-Size": safeLimit,
+      // The listing shows none of these, and leaving them out makes large pages several times smaller.
+      excludeElements: LISTING_EXCLUDED_ELEMENTS,
+      excludeFields: "summary,tagline,file",
     };
 
     if (type) {
@@ -260,6 +266,11 @@ export class PlexTools {
         ...showContext(item),
         guid: item.guid,
         editionTitle: item.editionTitle,
+        contentRating: item.contentRating,
+        contentRatingAge: item.contentRatingAge,
+        genres: tagNames(item.Genre),
+        studio: item.studio,
+        audienceRating: item.audienceRating,
         labels: tagNames(item.Label),
         ...watchState(item),
       })),
