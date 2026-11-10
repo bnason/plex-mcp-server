@@ -1,0 +1,103 @@
+/**
+ * Plex API constants and configuration defaults
+ */
+export const PLEX_TYPE_IDS = {
+    movie: 1,
+    show: 2,
+    season: 3,
+    episode: 4,
+    artist: 8,
+    album: 9,
+    track: 10,
+};
+/**
+ * Type IDs for item kinds that can carry tags, sent as `type` with a tag edit
+ * (PUT /library/sections/{id}/all). Plex answers a wrong type with 200 and writes
+ * nothing, so every taggable kind needs its own id. A superset of PLEX_TYPE_IDS,
+ * kept separate so the listing tools don't start accepting these kinds.
+ * collection (18) confirmed against a live server on 2026-10-31 (#209); clip (12)
+ * is python-plexapi's SEARCHTYPES (plexapi/utils.py; Clip has TYPE = 'clip').
+ * No photo entry, on purpose: Plex reports photo albums as type "photo" too
+ * (python-plexapi's Photoalbum has TYPE = 'photo' but edits with 'photoalbum', 14),
+ * so item.type alone can't pick 13 or 14. A wrong id is a silent no-op, so photos
+ * and albums keep failing loudly until that can be checked against a photo library.
+ */
+export const PLEX_TAGGABLE_TYPE_IDS = {
+    ...PLEX_TYPE_IDS,
+    clip: 12,
+    collection: 18,
+};
+/**
+ * Numeric libtype IDs used inside smart playlist search URIs
+ * (e.g. /library/sections/1/all?type=N). This is a superset of PLEX_TYPE_IDS
+ * — it includes photoalbum/photo which are valid smart-playlist filter
+ * targets but are not exposed elsewhere.
+ */
+export const SMART_PLAYLIST_LIBTYPE_IDS = {
+    movie: 1,
+    show: 2,
+    season: 3,
+    episode: 4,
+    artist: 8,
+    album: 9,
+    track: 10,
+    photo: 13,
+    photoalbum: 14,
+};
+export const DEFAULT_LIMITS = {
+    recentlyAdded: 50,
+    recentlyWatched: 100,
+    watchHistory: 500,
+    fullyWatched: 500,
+    popularContent: 50,
+    libraryItems: 1000,
+    searchMedia: 500,
+    exportPageSize: 500,
+    recommendations: 10,
+};
+// Recommendation engine constants
+export const RECENCY_HALF_LIFE_DAYS = 180;
+export const TASTE_TOP_GENRES = 10;
+export const TASTE_TOP_DIRECTORS = 10;
+export const TASTE_TOP_ACTORS = 20;
+export const MIN_WATCHED_FOR_RECOMMENDATIONS = 5;
+export const DEFAULT_PLEX_URL = "http://localhost:32400";
+export const PLEX_CONTAINER_SIZE = 1000;
+/** Safety stop for paged listings: 500 pages of PLEX_CONTAINER_SIZE is 500k items. */
+export const PLEX_MAX_PAGES = 500;
+/** Safety stop for listings filtered on our side (history by type, fully watched shows). */
+export const PLEX_FILTERED_SCAN_MAX_PAGES = 50;
+export const SUMMARY_PREVIEW_LENGTH = 500;
+export const PLEX_MUTATIVE_OPS_ENV_VAR = "PLEX_ENABLE_MUTATIVE_OPS";
+/** Standardized completion threshold (90%) — was inconsistent 85%/90% across codebase */
+export const COMPLETION_THRESHOLD = 0.90;
+/** Minimum duration (ms) before applying completion threshold logic.
+ *  Content shorter than this is considered 'completed' if viewCount > 0.
+ *  Prevents short trailers/clips from false-positive completion detection. */
+export const MIN_COMPLETION_DURATION_MS = 5 * 60 * 1000; // 5 minutes
+export function isMutativeOpsEnabled() {
+    return process.env[PLEX_MUTATIVE_OPS_ENV_VAR] === "true";
+}
+/**
+ * Determine if item is completed, accounting for short-duration content.
+ * Items shorter than MIN_COMPLETION_DURATION_MS require only viewCount > 0.
+ * Longer items require progress >= COMPLETION_THRESHOLD, unless there is no
+ * viewOffset: Plex omits it (or reports 0) once an item is finished, so viewCount > 0
+ * alone then means completed.
+ */
+export function isContentCompleted(duration, viewOffset, viewCount) {
+    // No duration or view data → not completed
+    if (!duration || viewCount === undefined) {
+        return false;
+    }
+    // Only viewCount matters for short content
+    if (duration < MIN_COMPLETION_DURATION_MS) {
+        return viewCount > 0;
+    }
+    // No offset → not in progress, so a watched item is a finished one
+    if (!viewOffset) {
+        return viewCount > 0;
+    }
+    // For longer content, enforce threshold
+    return viewOffset >= duration * COMPLETION_THRESHOLD;
+}
