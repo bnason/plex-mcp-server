@@ -12,6 +12,7 @@ import { PlexMovie, PlexShow, PlexEpisode, PlexWatchSession } from "../trakt/map
 import { validatePlexId } from "../shared/utils.js";
 
 const PLEX_DISCOVER_BASE_URL = "https://discover.provider.plex.tv";
+const PLEX_TV_BASE_URL = "https://plex.tv";
 
 export class PlexClient implements PlexAPIClient {
   constructor(private config: PlexConfig) {
@@ -23,12 +24,21 @@ export class PlexClient implements PlexAPIClient {
     };
   }
 
-  async makeRequest(endpoint: string, params: Record<string, string | number> = {}, method: string = "GET"): Promise<Record<string, unknown>> {
+  /**
+   * Call the Plex server. `token` replaces the configured token for this one request,
+   * to read the server as another user (see PlexUsers).
+   */
+  async makeRequest(
+    endpoint: string,
+    params: Record<string, string | number> = {},
+    method: string = "GET",
+    token?: string
+  ): Promise<Record<string, unknown>> {
     const url = `${this.config.baseUrl}${endpoint}`;
     const axiosConfig: AxiosRequestConfig = {
       method,
       headers: {
-        "X-Plex-Token": this.config.token,
+        "X-Plex-Token": token ?? this.config.token,
         Accept: "application/json",
       },
       params,
@@ -36,6 +46,22 @@ export class PlexClient implements PlexAPIClient {
 
     const response = await axios(url, axiosConfig);
     return response.data;
+  }
+
+  /** GET a plex.tv account endpoint as the configured user; these answer in XML. */
+  async makePlexTvRequest(endpoint: string): Promise<string> {
+    const response = await axios(`${PLEX_TV_BASE_URL}${endpoint}`, {
+      method: "GET",
+      headers: {
+        "X-Plex-Token": this.config.token,
+        "X-Plex-Client-Identifier": this.config.clientIdentifier,
+        "X-Plex-Product": "plex-mcp-server",
+        Accept: "application/xml",
+      },
+      responseType: "text",
+      transformResponse: (data) => data,
+    });
+    return String(response.data);
   }
 
   async makeDiscoverRequest(

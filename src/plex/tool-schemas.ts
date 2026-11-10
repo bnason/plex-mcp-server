@@ -19,7 +19,9 @@ const GET_LIBRARIES_SCHEMA = {
 
 const GET_LIBRARY_ITEMS_SCHEMA = {
   name: "get_library_items",
-  description: "List items in a library with pagination (useful for large libraries)",
+  description:
+    "List items in a library with pagination (useful for large libraries). " +
+    "Filter by label, or pass user to list what a Home or shared user sees.",
   inputSchema: {
     type: "object" as const,
     properties: {
@@ -32,6 +34,13 @@ const GET_LIBRARY_ITEMS_SCHEMA = {
       limit: { type: "number", description: "Number of items to return (default: 1000)", default: 1000 },
       offset: { type: "number", description: "Zero-based offset for pagination (default: 0)", default: 0 },
       sort: { type: "string", description: "Sort order (optional, e.g., titleSort:asc)" },
+      label: { type: "string", description: "Only items with this label (name, case-insensitive)" },
+      user: {
+        type: "string",
+        description:
+          "Read as this Home or shared user (name or plex.tv user id), seeing only what they can see " +
+          "(label restrictions, ratings, shared libraries). Omit for the server owner.",
+      },
     },
     required: ["libraryKey"],
   },
@@ -75,6 +84,12 @@ const SEARCH_MEDIA_SCHEMA = {
       libraryKey: { type: "string", description: "Library section key to restrict search (optional)" },
       limit: { type: "number", description: "Number of items to return (default: 500)", default: 500 },
       offset: { type: "number", description: "Zero-based offset for pagination (default: 0)", default: 0 },
+      user: {
+        type: "string",
+        description:
+          "Read as this Home or shared user (name or plex.tv user id), seeing only what they can see " +
+          "(label restrictions, ratings, shared libraries). Omit for the server owner.",
+      },
     },
     required: ["query"],
   },
@@ -115,6 +130,12 @@ const GET_MEDIA_DETAILS_SCHEMA = {
     type: "object" as const,
     properties: {
       ratingKey: { type: "string", description: "The rating key of the media item" },
+      user: {
+        type: "string",
+        description:
+          "Read as this Home or shared user (name or plex.tv user id), returning visible: false if they cannot see it " +
+          "(label restrictions, ratings, shared libraries). Omit for the server owner.",
+      },
     },
     required: ["ratingKey"],
   },

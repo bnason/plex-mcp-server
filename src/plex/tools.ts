@@ -8,6 +8,7 @@ import { createWriteStream } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
 import path from "node:path";
 import { PlexClient } from "./client.js";
+import { PlexUsers } from "./users.js";
 import { MCPResponse, LibraryMovieRecord, TasteProfile } from "./types.js";
 import {
   DEFAULT_LIMITS,
@@ -133,10 +134,41 @@ type MetadataUpdateInput = {
 
 type EditableTagType = "genre" | "collection" | "role" | "director" | "label";
 
+/** Helper: the HTTP status of a failed Plex request, if it has one. */
+function httpStatus(error: unknown): number | undefined {
+  const status = (error as { response?: { status?: unknown } } | null)?.response?.status;
+  return typeof status === "number" ? status : undefined;
+}
+
+/** Helper: the tag names of one of an item's tag lists (Label, Genre, ...). */
+function tagNames(value: unknown): string[] | undefined {
+  return Array.isArray(value) ? value.map((tag) => (tag as { tag?: string }).tag).filter((tag): tag is string => !!tag) : undefined;
+}
+
 export class PlexTools {
   private machineIdentifier?: string;
+  private users: PlexUsers;
 
-  constructor(private client: PlexClient) {}
+  constructor(private client: PlexClient) {
+    this.users = new PlexUsers(client);
+  }
+
+  /**
+   * Helper: the id Plex filters a library by for a label name.
+   * Matched without case; an unknown label lists the library's labels.
+   */
+  private async labelFilterId(libraryKey: string, label: string, typeId?: number): Promise<string> {
+    const data = await this.client.makeRequest(`/library/sections/${libraryKey}/label`, typeId ? { type: typeId } : {});
+    const tags = ((data as { MediaContainer?: { Directory?: Record<string, unknown>[] } }).MediaContainer?.Directory || []);
+    const wanted = label.trim().toLowerCase();
+    const match = tags.find((tag) => String(tag.title ?? "").toLowerCase() === wanted);
+    const id = match && (/^\d+$/.test(String(match.key)) ? String(match.key) : String(match.fastKey ?? match.key ?? "").match(/[?&]label=(\d+)/)?.[1]);
+    if (!id) {
+      const names = tags.map((tag) => tag.title).filter(Boolean).join(", ");
+      throw new McpError(ErrorCode.InvalidRequest, `No label "${label}" in library ${libraryKey}. Labels: ${names || "none"}`);
+    }
+    return id;
+  }
 
   // ── Core tools ──────────────────────────────────────────────
 
@@ -161,9 +193,12 @@ export class PlexTools {
     type?: string,
     limit: number = DEFAULT_LIMITS.libraryItems,
     offset: number = 0,
-    sort?: string
+    sort?: string,
+    user?: string,
+    label?: string
   ): Promise<MCPResponse> {
     validatePlexId(libraryKey, "libraryKey");
+    const token = await this.users.tokenFor(user);
 
     const safeLimit = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : DEFAULT_LIMITS.libraryItems;
     const safeOffset = Number.isFinite(offset) && offset >= 0 ? Math.floor(offset) : 0;
@@ -178,8 +213,11 @@ export class PlexTools {
     if (sort) {
       params.sort = sort;
     }
+    if (label) {
+      params.label = await this.labelFilterId(libraryKey, label, params.type as number | undefined);
+    }
 
-    const data = await this.client.makeRequest(`/library/sections/${libraryKey}/all`, params);
+    const data = await this.client.makeRequest(`/library/sections/${libraryKey}/all`, params, "GET", token);
     const container = validatePlexTotalSize(data);
     const items = container.MediaContainer?.Metadata || [];
     const totalSize = container.MediaContainer?.totalSize || 0;
@@ -192,6 +230,8 @@ export class PlexTools {
 
     return jsonResponse({
       libraryKey,
+      ...(user ? { user } : {}),
+      ...(label ? { label } : {}),
       offset: safeOffset,
       limit: safeLimit,
       totalSize,
@@ -205,6 +245,7 @@ export class PlexTools {
         ...showContext(item),
         guid: item.guid,
         editionTitle: item.editionTitle,
+        labels: tagNames(item.Label),
       })),
     });
   }
@@ -326,9 +367,11 @@ export class PlexTools {
     type?: string,
     libraryKey?: string,
     limit: number = DEFAULT_LIMITS.searchMedia,
-    offset: number = 0
+    offset: number = 0,
+    user?: string
   ): Promise<MCPResponse> {
     const sanitizedQuery = sanitizeSearchQuery(query);
+    const token = await this.users.tokenFor(user);
 
     const safeLimit = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : DEFAULT_LIMITS.searchMedia;
     const safeOffset = Number.isFinite(offset) && offset >= 0 ? Math.floor(offset) : 0;
@@ -345,12 +388,13 @@ export class PlexTools {
       validatePlexId(libraryKey, "libraryKey");
     }
     const endpoint = libraryKey ? `/library/sections/${libraryKey}/search` : "/search";
-    const data = await this.client.makeRequest(endpoint, params);
+    const data = await this.client.makeRequest(endpoint, params, "GET", token);
     const container = data as { MediaContainer?: { Metadata?: Record<string, unknown>[] } };
     const results = container.MediaContainer?.Metadata || [];
 
     return jsonResponse({
       query: sanitizedQuery,
+      ...(user ? { user } : {}),
       libraryKey: libraryKey || "all",
       offset: safeOffset,
       limit: safeLimit,
@@ -605,17 +649,27 @@ export class PlexTools {
     });
   }
 
-  async getMediaDetails(ratingKey: string): Promise<MCPResponse> {
+  async getMediaDetails(ratingKey: string, user?: string): Promise<MCPResponse> {
     validatePlexId(ratingKey, "ratingKey");
-    const data = await this.client.makeRequest(`/library/metadata/${ratingKey}`);
+    const token = await this.users.tokenFor(user);
+    let data: Record<string, unknown>;
+    try {
+      data = await this.client.makeRequest(`/library/metadata/${ratingKey}`, {}, "GET", token);
+    } catch (error) {
+      // Plex answers 401/403/404 for an item hidden from this user.
+      if (token && [401, 403, 404].includes(httpStatus(error) ?? 0)) return jsonResponse({ ratingKey, user, visible: false });
+      throw error;
+    }
     const container = data as { MediaContainer?: { Metadata?: Record<string, unknown>[] } };
     const item = container.MediaContainer?.Metadata?.[0];
 
     if (!item) {
+      if (token) return jsonResponse({ ratingKey, user, visible: false });
       throw new McpError(ErrorCode.InvalidRequest, `Media item not found: ${ratingKey}`);
     }
 
     return jsonResponse({
+      ...(user ? { user, visible: true } : {}),
       details: {
         ratingKey: item.ratingKey,
         title: item.title,
